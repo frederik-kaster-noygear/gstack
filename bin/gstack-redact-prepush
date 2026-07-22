@@ -22,6 +22,22 @@
  *   - MEDIUM → warn (non-blocking). LOW/WARN → silent.
  *   - GSTACK_REDACT_PREPUSH=skip → log + exit 0 (escape valve).
  *
+ * Path-ignore (opt-in, auditable): a repo can exempt generated data files (big
+ * CSV/JSON exports that oversize the 1 MiB scan cap and would otherwise trip a
+ * false-positive HIGH `engine.input_too_large`) from the scan. Ignore globs come
+ * from two merged sources:
+ *   - committed `.gstack/redact-prepush-ignore` at the repo root (one glob per
+ *     line, `#` comments, blank lines skipped) — the recommended mechanism, since
+ *     it is versioned and reviewable in git history and shared across contributors.
+ *   - `gstack-config get redact_prepush_ignore_globs` (comma-separated) — a
+ *     machine-local supplement in ~/.gstack (never committed).
+ * Globs are matched against repo-root-relative paths (Bun.Glob, so `**` spans
+ * directories). Matched paths are dropped from the scanned diff via a git
+ * `:(exclude)` pathspec, and a one-line stderr notice always reports how many
+ * paths / bytes were skipped — an exemption is never silent. This does NOT weaken
+ * the #1946 fail-closed posture: anything NOT matched by an explicit ignore glob
+ * still goes through scan() and a huge non-ignored file still blocks fail-closed.
+ *
  * Installed/uninstalled via `gstack-redact install-prepush-hook` (see the
  * gstack-redact CLI), which chains any pre-existing hook.
  */
@@ -189,7 +205,11 @@ function unknownRemoteTipBase(localSha: string): string | null {
  * resolving a merge is still caught, while an ordinary merge contributes
  * nothing. Returns null when the notion does not apply, so callers fall back.
  */
-function addedLinesFromNewCommits(localSha: string, remoteSha: string): string | null {
+function addedLinesFromNewCommits(
+  localSha: string,
+  remoteSha: string,
+  pathspecs: string[] = [],
+): string | null {
   // remoteSha is what git TELLS us the remote has, and it is authoritative in a
   // way `--remotes` is not: remote-tracking refs can be absent (a fresh clone
   // that never fetched, a push to a remote with no tracking ref) or stale. Drop
@@ -221,30 +241,100 @@ function addedLinesFromNewCommits(localSha: string, remoteSha: string): string |
     out.push(gitStrict([
       "show", "--unified=0", "--no-color", "--no-ext-diff", "--no-textconv",
       "--cc", "--format=", sha,
+      ...(pathspecs.length ? ["--", ...pathspecs] : []),
     ]));
   }
   return out.join("\n");
 }
 
-/** Return the added-line text for a ref update being pushed. */
-function addedLinesFor(localSha: string, remoteSha: string): string {
-  // Preferred ONLY when this push carries catch-up commits: scanning them again
-  // is the bug. Every other shape falls through to the range logic below.
-  const fromNew = addedLinesFromNewCommits(localSha, remoteSha);
-  if (fromNew !== null) return collectAddedLines(fromNew);
+/**
+ * Read the merged, deduped ignore-glob list from the committed
+ * `.gstack/redact-prepush-ignore` file plus the machine-local
+ * `redact_prepush_ignore_globs` config key. Empty by default (no behavior
+ * change for existing repos). Best-effort: an unreadable source contributes
+ * nothing rather than blocking the push on a config error.
+ */
+function readIgnoreGlobs(): string[] {
+  const globs: string[] = [];
 
-  let range: string;
+  // 1) Committed, reviewable file at the repo root.
+  const repoRoot = git(["rev-parse", "--show-toplevel"]).trim();
+  if (repoRoot) {
+    try {
+      const raw = fs.readFileSync(path.join(repoRoot, ".gstack", "redact-prepush-ignore"), "utf8");
+      for (const line of raw.split("\n")) {
+        const g = line.trim();
+        if (g && !g.startsWith("#")) globs.push(g);
+      }
+    } catch {
+      // no file (the common case) or unreadable → contribute nothing
+    }
+  }
+
+  // 2) Machine-local config supplement (comma-separated; never committed).
+  try {
+    const configBin = path.join(import.meta.dir, "gstack-config");
+    const r = spawnSync(configBin, ["get", "redact_prepush_ignore_globs"], { encoding: "utf8" });
+    if (r.status === 0) {
+      for (const g of (r.stdout ?? "").trim().split(",")) {
+        const t = g.trim();
+        if (t) globs.push(t);
+      }
+    }
+  } catch {
+    // gstack-config missing/unreadable → contribute nothing
+  }
+
+  return [...new Set(globs)];
+}
+
+/** Sum the byte length of added lines in a unified diff (skip the +++ header). */
+function addedByteLen(diff: string): number {
+  let bytes = 0;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      bytes += Buffer.byteLength(line.slice(1), "utf8");
+    }
+  }
+  return bytes;
+}
+
+export interface SkipSummary {
+  paths: number;
+  bytes: number;
+  samples: string[];
+}
+
+/**
+ * The scan range for a ref update, used by the diff strategy and by the
+ * ignore-glob path partitioning so the two cannot disagree about what is being
+ * pushed.
+ */
+function scanRangeFor(localSha: string, remoteSha: string): string {
   if (ZERO.test(remoteSha) || !objectExists(remoteSha)) {
     // Either a new branch (zero remote sha), or the remote tip object is absent
     // locally (shallow clone, force-push without a prior fetch, CI checkout) so
     // remote..local cannot resolve. Both need a base derived locally; scan MORE
     // rather than hard-blocking a legitimate push (adversarial review finding 8).
     const base = unknownRemoteTipBase(localSha);
-    range = base ? `${base}..${localSha}` : `${EMPTY_TREE}..${localSha}`;
-  } else {
-    // Existing branch (incl. force-push): net new content remote..local.
-    range = `${remoteSha}..${localSha}`;
+    return base ? `${base}..${localSha}` : `${EMPTY_TREE}..${localSha}`;
   }
+  // Existing branch (incl. force-push): net new content remote..local.
+  return `${remoteSha}..${localSha}`;
+}
+
+/**
+ * Added-line text for a ref update, optionally restricted to `pathspecs`.
+ * Both strategies take the pathspecs, so an ignore rule cannot exempt a path on
+ * one code path and scan it on the other.
+ */
+function addedLinesCore(localSha: string, remoteSha: string, pathspecs: string[] = []): string {
+  // Preferred ONLY when this push carries catch-up commits: scanning them again
+  // is the bug. Every other shape falls through to the range logic below.
+  const fromNew = addedLinesFromNewCommits(localSha, remoteSha, pathspecs);
+  if (fromNew !== null) return collectAddedLines(fromNew);
+
+  const range = scanRangeFor(localSha, remoteSha);
   // -U0: only changed lines; we keep lines starting with '+' (added), drop the
   // +++ file header. Unified diff added lines start with a single '+'.
   // Strict (#1946): a failed diff used to return "" and the push sailed
@@ -259,8 +349,62 @@ function addedLinesFor(localSha: string, remoteSha: string): string {
   const diff = gitStrict([
     "diff", "--unified=0", "--no-color", "--no-ext-diff", "--no-textconv",
     range,
+    ...(pathspecs.length ? ["--", ...pathspecs] : []),
   ]);
   return collectAddedLines(diff);
+}
+
+/**
+ * Return the added-line text for a ref update being pushed, plus a summary of
+ * any paths excluded by ignore globs. Excluded paths never reach scan().
+ */
+function addedLinesFor(
+  localSha: string,
+  remoteSha: string,
+  ignoreGlobs: string[],
+): { added: string; skip: SkipSummary } {
+  const emptySkip: SkipSummary = { paths: 0, bytes: 0, samples: [] };
+
+  // Fast path: no ignore rules → exactly the upstream behavior, no extra calls.
+  if (ignoreGlobs.length === 0) {
+    return { added: addedLinesCore(localSha, remoteSha), skip: emptySkip };
+  }
+
+  const range = scanRangeFor(localSha, remoteSha);
+  // Partition the changed paths against the ignore globs in-process (Bun.Glob,
+  // so `**` spans directories). We match paths ourselves rather than lean on
+  // git pathspec glob magic, which keeps the ignore semantics predictable and
+  // lets us report exactly what was skipped.
+  const names = gitStrict(["diff", "--name-only", range])
+    .split("\n")
+    .map((n) => n.trim())
+    .filter(Boolean);
+  const matchers = ignoreGlobs.map((g) => new Bun.Glob(g));
+  const ignored = names.filter((n) => matchers.some((m) => m.match(n)));
+
+  if (ignored.length === 0) {
+    return { added: addedLinesCore(localSha, remoteSha), skip: emptySkip };
+  }
+
+  // Scan everything EXCEPT the ignored paths. `.` anchors at the pre-push cwd
+  // (repo root); each ignored path is a literal `:(exclude)` pathspec, so no
+  // glob magic and a small, bounded argv (ignored sets are typically tiny).
+  const added = addedLinesCore(localSha, remoteSha, [
+    ".",
+    ...ignored.map((n) => `:(exclude)${n}`),
+  ]);
+
+  // Skip accounting: diff ONLY the ignored paths to report added bytes. This is
+  // for the visibility notice; the bytes never reach scan().
+  const skippedDiff = gitStrict([
+    "diff", "--unified=0", "--no-color", "--no-ext-diff", "--no-textconv",
+    range, "--", ...ignored,
+  ]);
+
+  return {
+    added,
+    skip: { paths: ignored.length, bytes: addedByteLen(skippedDiff), samples: ignored.slice(0, 3) },
+  };
 }
 
 /**
@@ -345,14 +489,21 @@ function scanAddedLines(added: string, opts: Parameters<typeof scan>[1]): Findin
   return findings;
 }
 
-function logSkip(reason: string): void {
+/** Human-readable byte size for the skip notice. */
+function humanBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function logSkip(reason: string, extra: Record<string, unknown> = {}): void {
   try {
     const home = process.env.GSTACK_HOME || path.join(os.homedir(), ".gstack");
     const dir = path.join(home, "security");
     fs.mkdirSync(dir, { recursive: true });
     fs.appendFileSync(
       path.join(dir, "prepush-skip.jsonl"),
-      JSON.stringify({ ts: new Date().toISOString(), reason }) + "\n",
+      JSON.stringify({ ts: new Date().toISOString(), reason, ...extra }) + "\n",
     );
   } catch {
     // best-effort; never block a push because logging failed
@@ -373,8 +524,10 @@ function main() {
     .filter(Boolean)
     .map((l) => l.split(/\s+/));
 
+  const ignoreGlobs = readIgnoreGlobs();
   const allHigh: Finding[] = [];
   let mediumCount = 0;
+  const totalSkip: SkipSummary = { paths: 0, bytes: 0, samples: [] };
 
   for (const fields of refs) {
     // Fail CLOSED on a ref line we cannot parse (#2498): git hands pre-push
@@ -395,7 +548,13 @@ function main() {
     if (ZERO.test(localSha!)) continue; // branch delete → nothing pushed
     let added: string;
     try {
-      added = addedLinesFor(localSha, remoteSha || "0");
+      const r = addedLinesFor(localSha, remoteSha || "0", ignoreGlobs);
+      added = r.added;
+      totalSkip.paths += r.skip.paths;
+      totalSkip.bytes += r.skip.bytes;
+      for (const s of r.skip.samples) {
+        if (totalSkip.samples.length < 3 && !totalSkip.samples.includes(s)) totalSkip.samples.push(s);
+      }
     } catch (err) {
       // Fail CLOSED (#1946): if we can't compute the pushed diff we can't
       // scan it, and unscanned-but-allowed is the failure mode this hook
@@ -417,6 +576,23 @@ function main() {
       if (f.severity === "HIGH") allHigh.push(f);
       else if (f.severity === "MEDIUM") mediumCount++;
     }
+  }
+
+  // Always surface an exemption — a skipped path must never be silent.
+  if (totalSkip.paths > 0) {
+    const eg = totalSkip.samples.length
+      ? ` e.g. ${totalSkip.samples.join(", ")}${totalSkip.paths > totalSkip.samples.length ? ", ..." : ""}`
+      : "";
+    process.stderr.write(
+      `gstack-redact-prepush: skipped ${totalSkip.paths} path(s) / ${humanBytes(totalSkip.bytes)} ` +
+        `from the credential scan via ignore rules (.gstack/redact-prepush-ignore / ` +
+        `redact_prepush_ignore_globs).${eg}\n`,
+    );
+    logSkip("ignore-globs", {
+      paths: totalSkip.paths,
+      bytes: totalSkip.bytes,
+      samples: totalSkip.samples,
+    });
   }
 
   if (mediumCount > 0) {
