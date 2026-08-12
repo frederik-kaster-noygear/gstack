@@ -25,6 +25,12 @@ beforeEach(async () => {
 });
 
 afterAll(async () => {
+  // Drain before restoring. logTelemetry is fire-and-forget and resolves the
+  // path TWICE — once for ensureDir(), then again inside the .then() for
+  // telemetryFile(). Restoring GSTACK_HOME in that window makes the append
+  // re-resolve to os.homedir()/.gstack and land in the developer's REAL
+  // analytics file. Let in-flight writes settle into TMP_HOME first.
+  await new Promise((r) => setTimeout(r, 50));
   if (PRIOR_GSTACK_HOME === undefined) delete process.env.GSTACK_HOME;
   else process.env.GSTACK_HOME = PRIOR_GSTACK_HOME;
   if (PRIOR_TELEMETRY_OFF === undefined) delete process.env.GSTACK_TELEMETRY_OFF;
