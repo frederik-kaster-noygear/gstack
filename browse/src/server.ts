@@ -20,6 +20,8 @@ import { handleWriteCommand } from './write-commands';
 import { handleMetaCommand } from './meta-commands';
 import { hasActivePicker } from './cookie-picker-routes';
 import { COMMAND_DESCRIPTIONS, PAGE_CONTENT_COMMANDS, DOM_CONTENT_COMMANDS, wrapUntrustedContent, canonicalizeCommand, buildUnknownCommandError, ALL_COMMANDS } from './commands';
+import { checkNavProvenance } from './nav-guard';
+import type { TabSession } from './tab-session';
 import {
   wrapUntrustedPageContent, datamarkContent,
   runContentFilters, type ContentFilterResult,
@@ -1118,13 +1120,48 @@ async function handleCommandInternalImpl(
 
     const tabWarning = await browserManager.ensureCommandTab(command);
 
+    // Resolve THIS request's tab once, here, and use it for the rest of the
+    // command. Under runInRequestTab's scope (tabId or session) getActiveSession()
+    // is this request's own tab. Without a scope it is the daemon's global
+    // active tab, which a concurrent request can move at any `await` (this
+    // function is async and requests interleave), so capturing it once keeps
+    // every read and every URL below on the same tab.
+    //
+    // Resolved after ensureCommandTab, which may have opened a fresh tab, and
+    // without throwing here: status, stop and restart must run with no tab at
+    // all (#3167). Code that needs a tab calls requireSession(), which throws
+    // the usual "No active page" / "Tab N not found" error.
+    let resolvedSession: TabSession | null = null;
+    let sessionError: unknown = null;
+    try {
+      resolvedSession = browserManager.getActiveSession();
+    } catch (err) {
+      sessionError = err;
+    }
+    const requireSession = (): TabSession => {
+      if (!resolvedSession) throw sessionError;
+      return resolvedSession;
+    };
+
+    // URL of THIS request's tab. Every consumer below must use this rather than
+    // browserManager.getCurrentUrl(), which resolves through activeTabId and so
+    // reports whichever tab a concurrent request pinned most recently. That is
+    // the mislabelling half of the silent-wrong-page bug: the content comes
+    // from the request's session, and a globally-resolved URL would stamp
+    // another tab's address onto it — in the `source:` banner the model reads
+    // as provenance. Called fresh at each site (not cached) because `goto`
+    // changes it mid-command.
+    const tabUrl = (): string => {
+      try { return requireSession().getPage().url(); } catch { return 'about:blank'; }
+    };
+
     // Per-request warnings collected during hidden-element detection,
     // surfaced into the envelope the LLM sees. Carries across the read
     // phase into the centralized wrap block below.
     let hiddenContentWarnings: string[] = [];
 
     if (READ_COMMANDS.has(command)) {
-      const session = browserManager.getActiveSession();
+      const session = requireSession();
       const isScoped = tokenInfo && tokenInfo.clientId !== 'root';
       // Hidden-element / ARIA-injection detection for every scoped
       // DOM-reading channel (text, html, links, forms, accessibility,
@@ -1159,7 +1196,7 @@ async function handleCommandInternalImpl(
         result = await handleReadCommand(command, args, session, browserManager);
       }
     } else if (WRITE_COMMANDS.has(command)) {
-      const session = browserManager.getActiveSession();
+      const session = requireSession();
       result = await browserManager.failIfNavigationBlocked(session.getPage(), handleWriteCommand(command, args, session, browserManager));
     } else if (META_COMMANDS.has(command)) {
       // Pass chain depth + executeCommand callback so chain routes subcommands
@@ -1185,7 +1222,9 @@ async function handleCommandInternalImpl(
             return;
           }
           try {
-            const snapshot = await handleSnapshot(['-i'], browserManager.getActiveSession());
+            // requireSession(), not getActiveSession(): `watch` polls the tab the
+            // watch was started on, which a concurrent request must not divert.
+            const snapshot = await handleSnapshot(['-i'], requireSession());
             browserManager.addWatchSnapshot(snapshot);
           } catch {
             // Page may be navigating — skip this snapshot
@@ -1214,11 +1253,39 @@ async function handleCommandInternalImpl(
     // Root tokens: basic untrusted content wrapper (backward compat)
     // Chain exempt from top-level wrapping (each subcommand wrapped individually)
     if (PAGE_CONTENT_COMMANDS.has(command) && command !== 'chain') {
+      // ─── Nav provenance guard (silent-wrong-page) ───
+      // Runs BEFORE any wrapping: if the tab is not on the page the caller's
+      // goto committed to, returning the content — even correctly labelled —
+      // hands the caller another site's text under their own question. Fail
+      // loudly instead. See nav-guard.ts for why this must be per-tab.
+      const session = requireSession();
+      const prov = session.getNavProvenance();
+      const verdict = checkNavProvenance({
+        currentUrl: tabUrl(),
+        lastGotoUrl: prov.lastGotoUrl,
+        gotosSinceRead: prov.gotosSinceRead,
+        command,
+      });
+      if (!verdict.ok) {
+        // Clear the counter as part of reporting. The refusal IS the signal;
+        // leaving it set would poison the tab permanently, since every later
+        // goto increments it again and no read ever gets through to reset it.
+        // After a refusal a clean goto+read pair must work again — under
+        // sustained contention it will simply refuse again, which is correct
+        // and is what surfaces sustained contention instead of hiding it.
+        session.recordContentRead();
+        return {
+          status: 409, json: true,
+          result: JSON.stringify({ error: verdict.error, hint: verdict.hint }),
+        };
+      }
+      session.recordContentRead();
+
       const isScoped = tokenInfo && tokenInfo.clientId !== 'root';
       if (isScoped) {
         // Run content filters
         const filterResult: ContentFilterResult = runContentFilters(
-          result, browserManager.getCurrentUrl(), command,
+          result, tabUrl(), command,
         );
         if (filterResult.blocked) {
           return { status: 403, json: true, result: JSON.stringify({ error: filterResult.message }) };
@@ -1238,7 +1305,7 @@ async function handleCommandInternalImpl(
         );
       } else {
         // Root token: basic wrapping (backward compat, Decision 2)
-        result = wrapUntrustedContent(result, browserManager.getCurrentUrl());
+        result = wrapUntrustedContent(result, tabUrl());
       }
     }
 
@@ -1249,7 +1316,7 @@ async function handleCommandInternalImpl(
         type: 'command_end',
         command,
         args,
-        url: browserManager.getCurrentUrl(),
+        url: tabUrl(),
         duration: successDuration,
         status: 'ok',
         result: result,
@@ -1264,7 +1331,7 @@ async function handleCommandInternalImpl(
       cmd: command,
       aliasOf: isAliased ? rawCommand : undefined,
       args,
-      origin: browserManager.getCurrentUrl(),
+      origin: tabUrl(),
       durationMs: successDuration,
       status: 'ok',
       hasCookies: browserManager.hasCookieImports(),
