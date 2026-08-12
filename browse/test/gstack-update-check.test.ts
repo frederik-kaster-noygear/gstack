@@ -17,13 +17,21 @@ let gstackDir: string;
 let stateDir: string;
 
 function run(extraEnv: Record<string, string> = {}, args: string[] = []) {
+  // This script reads GSTACK_STATE_DIR directly, but it also shells out to
+  // bin/gstack-config, which ranks GSTACK_STATE_ROOT > GSTACK_HOME above it. A
+  // GSTACK_HOME leaked by another test file (telemetry, domain-skills-*) makes
+  // that child read the wrong config and report an upgrade — a wrong-value
+  // failure, not an error. Pin all three, after extraEnv so overrides still win.
+  const dir = extraEnv.GSTACK_STATE_DIR ?? stateDir;
   const result = Bun.spawnSync(['bash', SCRIPT, ...args], {
     env: {
       ...process.env,
       GSTACK_DIR: gstackDir,
-      GSTACK_STATE_DIR: stateDir,
       GSTACK_REMOTE_URL: `file://${join(gstackDir, 'REMOTE_VERSION')}`,
       ...extraEnv,
+      GSTACK_STATE_DIR: dir,
+      GSTACK_HOME: dir,
+      GSTACK_STATE_ROOT: dir,
     },
     stdout: 'pipe',
     stderr: 'pipe',

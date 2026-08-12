@@ -15,11 +15,19 @@ const SCRIPT = join(import.meta.dir, '..', '..', 'bin', 'gstack-config');
 let stateDir: string;
 
 function run(args: string[] = [], extraEnv: Record<string, string> = {}) {
+  // The script resolves GSTACK_STATE_ROOT > GSTACK_HOME > GSTACK_STATE_DIR, so
+  // setting only GSTACK_STATE_DIR is not isolation: a GSTACK_HOME leaked by
+  // another test file (telemetry, domain-skills-*) silently outranks it and the
+  // script reads a different directory. Pin all three to the same dir, after
+  // extraEnv so a caller's GSTACK_STATE_DIR override still decides which dir.
+  const dir = extraEnv.GSTACK_STATE_DIR ?? stateDir;
   const result = Bun.spawnSync(['bash', SCRIPT, ...args], {
     env: {
       ...process.env,
-      GSTACK_STATE_DIR: stateDir,
       ...extraEnv,
+      GSTACK_STATE_DIR: dir,
+      GSTACK_HOME: dir,
+      GSTACK_STATE_ROOT: dir,
     },
     stdout: 'pipe',
     stderr: 'pipe',
