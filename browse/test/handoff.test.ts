@@ -27,8 +27,11 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
+  // Fire-and-forget: awaiting the browser close can outlive the hook timeout.
+  // Deliberately NOT calling process.exit() — that kills the whole
+  // `bun test browse/test/` run before later files report.
+  bm.close().catch(() => {});
   try { testServer.server.stop(); } catch {}
-  setTimeout(() => process.exit(0), 500);
 });
 
 // ─── Unit Tests: Failure Tracking (no browser needed) ────────────

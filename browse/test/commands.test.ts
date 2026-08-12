@@ -95,10 +95,11 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
-  // Force kill browser instead of graceful close (avoids hang)
+  // Fire-and-forget: bm.close() can hang, so don't await it. Deliberately NOT
+  // calling process.exit() — that kills the whole `bun test browse/test/` run
+  // before later files report.
+  bm.close().catch(() => {});
   try { testServer.server.stop(); } catch {}
-  // bm.close() can hang — just let process exit handle it
-  setTimeout(() => process.exit(0), 500);
 });
 
 // ─── Navigation ─────────────────────────────────────────────────

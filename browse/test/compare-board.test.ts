@@ -70,9 +70,12 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
+  // Fire-and-forget: awaiting the browser close can outlive the hook timeout.
+  // Deliberately NOT calling process.exit() — that kills the whole
+  // `bun test browse/test/` run before later files report.
+  bm.close().catch(() => {});
   try { server.stop(); } catch {}
   fs.rmSync(tmpDir, { recursive: true, force: true });
-  setTimeout(() => process.exit(0), 500);
 });
 
 // ─── DOM Structure ──────────────────────────────────────────────
