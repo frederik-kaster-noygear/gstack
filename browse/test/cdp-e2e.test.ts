@@ -23,7 +23,12 @@ const TMP_HOME = path.join(os.tmpdir(), `gstack-cdp-e2e-${process.pid}-${Date.no
 // exact leak once pointed a sibling test's GSTACK_HOME at our temp dir,
 // which then got baked into artifacts that outlived it (dangling symlinks
 // into a deleted render dir). Save + restore in afterAll.
+//
+// GSTACK_TELEMETRY_OFF needs the same treatment: telemetry.test.ts sets '0'
+// and this file sets '1', so without a restore they overwrite each other
+// depending on load order.
 const ORIGINAL_GSTACK_HOME = process.env.GSTACK_HOME;
+const ORIGINAL_TELEMETRY_OFF = process.env.GSTACK_TELEMETRY_OFF;
 process.env.GSTACK_HOME = TMP_HOME;
 process.env.GSTACK_TELEMETRY_OFF = '1'; // don't pollute analytics during tests
 
@@ -46,6 +51,8 @@ afterAll(async () => {
   else process.env.GSTACK_HOME = ORIGINAL_GSTACK_HOME;
   try { await bm.cleanup?.(); } catch {}
   try { testServer.server.stop(); } catch {}
+  if (ORIGINAL_TELEMETRY_OFF === undefined) delete process.env.GSTACK_TELEMETRY_OFF;
+  else process.env.GSTACK_TELEMETRY_OFF = ORIGINAL_TELEMETRY_OFF;
   await fs.rm(TMP_HOME, { recursive: true, force: true });
 });
 

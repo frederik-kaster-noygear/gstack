@@ -8,6 +8,15 @@ const TELEMETRY_FILE = path.join(TMP_HOME, 'analytics', 'browse-telemetry.jsonl'
 
 // Use GSTACK_HOME env to redirect telemetry writes (read each call,
 // not cached at module-load).
+//
+// Bun runs test files sequentially in one process (module-load → tests →
+// afterAll, then the next file), so an unrestored write here leaks into every
+// file loaded afterwards. Anything that then spawns a gstack bin script picks
+// it up, and GSTACK_HOME outranks both $HOME and GSTACK_STATE_DIR in those
+// scripts — so the leak silently redirects a supposedly isolated child. Save
+// and restore so the leak dies with this file.
+const PRIOR_GSTACK_HOME = process.env.GSTACK_HOME;
+const PRIOR_TELEMETRY_OFF = process.env.GSTACK_TELEMETRY_OFF;
 process.env.GSTACK_HOME = TMP_HOME;
 process.env.GSTACK_TELEMETRY_OFF = '0';
 
@@ -16,6 +25,10 @@ beforeEach(async () => {
 });
 
 afterAll(async () => {
+  if (PRIOR_GSTACK_HOME === undefined) delete process.env.GSTACK_HOME;
+  else process.env.GSTACK_HOME = PRIOR_GSTACK_HOME;
+  if (PRIOR_TELEMETRY_OFF === undefined) delete process.env.GSTACK_TELEMETRY_OFF;
+  else process.env.GSTACK_TELEMETRY_OFF = PRIOR_TELEMETRY_OFF;
   await fs.rm(TMP_HOME, { recursive: true, force: true });
 });
 

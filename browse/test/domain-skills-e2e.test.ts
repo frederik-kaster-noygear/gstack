@@ -17,6 +17,12 @@ import { startTestServer } from './test-server';
 import { BrowserManager } from '../src/browser-manager';
 
 const TMP_HOME = path.join(os.tmpdir(), `gstack-domain-e2e-${process.pid}-${Date.now()}`);
+// Restored in afterAll: Bun runs test files sequentially in one process, so an
+// unrestored write here leaks into every file loaded afterwards. GSTACK_HOME
+// outranks both $HOME and GSTACK_STATE_DIR in the gstack bin scripts, so the
+// leak silently redirects any later test that spawns one.
+const PRIOR_GSTACK_HOME = process.env.GSTACK_HOME;
+const PRIOR_PROJECT_SLUG = process.env.GSTACK_PROJECT_SLUG;
 process.env.GSTACK_HOME = TMP_HOME;
 process.env.GSTACK_PROJECT_SLUG = 'e2e-test-slug';
 
@@ -43,6 +49,10 @@ beforeAll(async () => {
 afterAll(async () => {
   try { await bm.cleanup?.(); } catch {}
   try { testServer.server.stop(); } catch {}
+  if (PRIOR_GSTACK_HOME === undefined) delete process.env.GSTACK_HOME;
+  else process.env.GSTACK_HOME = PRIOR_GSTACK_HOME;
+  if (PRIOR_PROJECT_SLUG === undefined) delete process.env.GSTACK_PROJECT_SLUG;
+  else process.env.GSTACK_PROJECT_SLUG = PRIOR_PROJECT_SLUG;
   await fs.rm(TMP_HOME, { recursive: true, force: true });
 });
 
