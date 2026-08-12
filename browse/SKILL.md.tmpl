@@ -340,6 +340,27 @@ $B cleanup --ads --cookies       # selective cleanup
 $B prettyscreenshot --cleanup --scroll-to ".pricing" --width 1440 ~/Desktop/hero.png
 ```
 
+## Running several agents at once
+
+One browse daemon serves every agent in a git repo, and they all share **one
+tab**. `goto` and `text` are separate processes, so another agent's `goto` can
+land in between and you would read *their* page:
+
+```
+agent A: $B goto https://example.com/a     # ok
+agent B: $B goto https://other.com/b       # same tab — clobbers A
+agent A: $B text                           # would have returned other.com/b
+```
+
+**This now fails loudly instead of lying.** When the tab is not on the page your
+`goto` committed to, page-content commands return a `409` naming both URLs
+rather than handing back the wrong site's text. `goto` also reports the URL it
+*actually* landed on, so a redirect is visible in its output.
+
+There is no per-agent tab isolation yet, so the guard is a detector, not a fix:
+if you see repeated `Refusing to run ...` errors, run your browse agents one at
+a time rather than in parallel.
+
 ## Full Command List
 
 {{COMMAND_REFERENCE}}

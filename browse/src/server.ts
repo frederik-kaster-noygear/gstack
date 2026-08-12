@@ -19,6 +19,7 @@ import { handleWriteCommand } from './write-commands';
 import { handleMetaCommand } from './meta-commands';
 import { handleCookiePickerRoute, hasActivePicker } from './cookie-picker-routes';
 import { COMMAND_DESCRIPTIONS, PAGE_CONTENT_COMMANDS, DOM_CONTENT_COMMANDS, wrapUntrustedContent, canonicalizeCommand, buildUnknownCommandError, ALL_COMMANDS } from './commands';
+import { checkNavProvenance } from './nav-guard';
 import {
   wrapUntrustedPageContent, datamarkContent,
   runContentFilters, type ContentFilterResult,
@@ -1050,8 +1051,19 @@ async function handleCommandInternalImpl(
   }
 
   // Pin to a specific tab if requested (set by BROWSE_TAB env var, e.g. per-tab agent contexts).
-  // This prevents parallel agents from interfering with each other's tab context.
-  // Safe because Bun's event loop is single-threaded — no concurrent handleCommand.
+  //
+  // NOTE: the previous comment here claimed this was "safe because Bun's event
+  // loop is single-threaded — no concurrent handleCommand". That is false and
+  // was the root of the silent-wrong-page bug: this function is async and
+  // yields at every await, so two /command requests interleave freely. The
+  // save/restore below is therefore also racy across concurrent pinned
+  // requests (A saves 0 pins 3; B saves 3 pins 5; A restores 0; B restores 3).
+  //
+  // This request's own work no longer depends on that pin holding: `session`
+  // below is resolved from `tabId` directly, and every URL on the read path
+  // comes from that session via tabUrl(). The pin is kept only for the code
+  // still reached through the browserManager globals (meta-commands, sidebar
+  // polling), which is why it must not be relied on for provenance.
   let savedTabId: number | null = null;
   if (tabId !== undefined && tabId !== null) {
     savedTabId = browserManager.getActiveTabId();
@@ -1121,7 +1133,27 @@ async function handleCommandInternalImpl(
   try {
     let result: string;
 
-    const session = browserManager.getActiveSession();
+    // Resolve THIS request's tab explicitly, from the id pinned above.
+    //
+    // Deliberately NOT getActiveSession(): activeTabId is global mutable state
+    // that every concurrent request re-pins, so resolving through it makes
+    // correctness depend on no `await` ever appearing between the pin and this
+    // line — a property nothing enforces and a future edit would silently
+    // break. Resolving from tabId is correct by construction.
+    const session = (tabId !== undefined && tabId !== null)
+      ? browserManager.getSession(tabId)
+      : browserManager.getActiveSession();
+
+    // URL of THIS request's tab. Every consumer below must use this rather than
+    // browserManager.getCurrentUrl(), which resolves through activeTabId and so
+    // reports whichever tab a concurrent request pinned most recently. That is
+    // the mislabelling half of the silent-wrong-page bug: the content comes
+    // from `session`, and a globally-resolved URL would stamp another tab's
+    // address onto it — in the `source:` banner the model reads as provenance.
+    // Called fresh at each site (not cached) because `goto` changes it mid-command.
+    const tabUrl = (): string => {
+      try { return session.getPage().url(); } catch { return 'about:blank'; }
+    };
 
     // Per-request warnings collected during hidden-element detection,
     // surfaced into the envelope the LLM sees. Carries across the read
@@ -1188,7 +1220,9 @@ async function handleCommandInternalImpl(
             return;
           }
           try {
-            const snapshot = await handleSnapshot(['-i'], browserManager.getActiveSession());
+            // `session`, not getActiveSession(): `watch` polls the tab the
+            // watch was started on, which a concurrent request must not divert.
+            const snapshot = await handleSnapshot(['-i'], session);
             browserManager.addWatchSnapshot(snapshot);
           } catch {
             // Page may be navigating — skip this snapshot
@@ -1217,11 +1251,38 @@ async function handleCommandInternalImpl(
     // Root tokens: basic untrusted content wrapper (backward compat)
     // Chain exempt from top-level wrapping (each subcommand wrapped individually)
     if (PAGE_CONTENT_COMMANDS.has(command) && command !== 'chain') {
+      // ─── Nav provenance guard (silent-wrong-page) ───
+      // Runs BEFORE any wrapping: if the tab is not on the page the caller's
+      // goto committed to, returning the content — even correctly labelled —
+      // hands the caller another site's text under their own question. Fail
+      // loudly instead. See nav-guard.ts for why this must be per-tab.
+      const prov = session.getNavProvenance();
+      const verdict = checkNavProvenance({
+        currentUrl: tabUrl(),
+        lastGotoUrl: prov.lastGotoUrl,
+        gotosSinceRead: prov.gotosSinceRead,
+        command,
+      });
+      if (!verdict.ok) {
+        // Clear the counter as part of reporting. The refusal IS the signal;
+        // leaving it set would poison the tab permanently, since every later
+        // goto increments it again and no read ever gets through to reset it.
+        // After a refusal a clean goto+read pair must work again — under
+        // sustained contention it will simply refuse again, which is correct
+        // and is what surfaces sustained contention instead of hiding it.
+        session.recordContentRead();
+        return {
+          status: 409, json: true,
+          result: JSON.stringify({ error: verdict.error, hint: verdict.hint }),
+        };
+      }
+      session.recordContentRead();
+
       const isScoped = tokenInfo && tokenInfo.clientId !== 'root';
       if (isScoped) {
         // Run content filters
         const filterResult: ContentFilterResult = runContentFilters(
-          result, browserManager.getCurrentUrl(), command,
+          result, tabUrl(), command,
         );
         if (filterResult.blocked) {
           return { status: 403, json: true, result: JSON.stringify({ error: filterResult.message }) };
@@ -1241,7 +1302,7 @@ async function handleCommandInternalImpl(
         );
       } else {
         // Root token: basic wrapping (backward compat, Decision 2)
-        result = wrapUntrustedContent(result, browserManager.getCurrentUrl());
+        result = wrapUntrustedContent(result, tabUrl());
       }
     }
 
@@ -1252,7 +1313,7 @@ async function handleCommandInternalImpl(
         type: 'command_end',
         command,
         args,
-        url: browserManager.getCurrentUrl(),
+        url: tabUrl(),
         duration: successDuration,
         status: 'ok',
         result: result,
@@ -1267,7 +1328,7 @@ async function handleCommandInternalImpl(
       cmd: command,
       aliasOf: isAliased ? rawCommand : undefined,
       args: args.join(' '),
-      origin: browserManager.getCurrentUrl(),
+      origin: tabUrl(),
       durationMs: successDuration,
       status: 'ok',
       hasCookies: browserManager.hasCookieImports(),
