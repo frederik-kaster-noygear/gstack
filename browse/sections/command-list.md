@@ -54,7 +54,7 @@ Refs are invalidated on navigation — run `snapshot` again after `goto`.
 |---------|-------------|
 | `back` | History back |
 | `forward` | History forward |
-| `goto <url>` | Navigate to URL (http://, https://, or file:// scoped to cwd/TEMP_DIR) |
+| `goto <url>` | Navigate to URL (http://, https://, or file:// scoped to cwd/TEMP_DIR). Reports the URL actually landed on, noting any redirect. If a concurrent agent replaces the page before your read, page-content reads 409 rather than return the wrong page. |
 | `load-html <file> [--wait-until load|domcontentloaded|networkidle] [--tab-id <N>]  |  load-html --from-file <payload.json> [--tab-id <N>]` | Load HTML via setContent. Accepts a file path under safe-dirs (validated), OR --from-file <payload.json> with {"html":"...","waitUntil":"..."} for large inline HTML (Windows argv safe). |
 | `reload` | Reload page |
 | `url` | Print current URL |

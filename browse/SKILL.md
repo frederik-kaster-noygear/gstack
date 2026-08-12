@@ -439,5 +439,26 @@ else `$B` can do — extraction, tabs, dialogs, uploads, meta/server commands, a
 full snapshot-flag reference — lives in the generated section below. Read it before
 reaching for a `$B` command that is not in the table.
 
+### Running several fallback agents at once
+
+One `$B` daemon serves every agent in a git repo, and they all share **one tab**.
+`goto` and `text` are separate processes, so another agent's `goto` can land in
+between and you would read *their* page:
+
+```
+agent A: $B goto https://example.com/a     # ok
+agent B: $B goto https://other.com/b       # same tab — clobbers A
+agent A: $B text                           # would have returned other.com/b
+```
+
+**This fails loudly instead of lying.** When the tab is not on the page your `goto`
+committed to, page-content commands return a `409` naming both URLs rather than
+handing back the wrong site's text. `goto` also reports the URL it *actually* landed
+on, so a redirect is visible in its output.
+
+There is no per-agent tab isolation yet, so the guard is a detector, not a fix: if
+you see repeated `Refusing to run ...` errors, run your `$B` agents one at a time
+rather than in parallel.
+
 > **STOP.** Before using any command or snapshot flag beyond the Browser fallback translation table — the full generated reference for every browse command, its argument shape, and every snapshot flag, Read `~/.claude/skills/gstack/browse/sections/command-list.md` and execute it
 > in full. Do not work from memory — that section is the source of truth for this step.

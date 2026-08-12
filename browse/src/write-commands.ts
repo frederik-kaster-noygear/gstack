@@ -10,6 +10,7 @@ import type { BrowserManager } from './browser-manager';
 import { findInstalledBrowsers, importCookies, importCookiesViaCdp, hasV20Cookies, listSupportedBrowserNames } from './cookie-import-browser';
 import { generatePickerCode } from './cookie-picker-routes';
 import { validateNavigationUrl } from './url-validation';
+import { originOf } from './nav-guard';
 import { validateOutputPath, validateReadPath } from './path-security';
 import { guardScreenshotPath } from './screenshot-size-guard';
 import * as fs from 'fs';
@@ -151,13 +152,24 @@ export async function handleWriteCommand(
       const normalizedUrl = await validateNavigationUrl(url);
       const response = await page.goto(normalizedUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
       const status = response?.status() || 'unknown';
-      return `Navigated to ${normalizedUrl} (${status})`;
+      // Report where we ACTUALLY landed, not what was asked for. Reporting the
+      // requested URL made goto claim success for a page the tab was no longer
+      // on (redirect, or a concurrent agent clobbering the shared tab), which is
+      // half of the silent-wrong-page bug the nav-guard closes. `back`/`forward`/
+      // `reload` already report page.url(); goto was the odd one out.
+      const landedUrl = page.url();
+      session.recordGoto(landedUrl);
+      const redirectNote = originOf(landedUrl) !== originOf(normalizedUrl)
+        ? ` [redirected from ${normalizedUrl}]`
+        : '';
+      return `Navigated to ${landedUrl} (${status})${redirectNote}`;
     }
 
     case 'back': {
       if (inFrame) throw new Error('Cannot use back inside a frame. Run \'frame main\' first.');
       session.clearLoadedHtml();
       await page.goBack({ waitUntil: 'domcontentloaded', timeout: 15000 });
+      session.recordNavigation(page.url());
       return `Back → ${page.url()}`;
     }
 
@@ -165,6 +177,7 @@ export async function handleWriteCommand(
       if (inFrame) throw new Error('Cannot use forward inside a frame. Run \'frame main\' first.');
       session.clearLoadedHtml();
       await page.goForward({ waitUntil: 'domcontentloaded', timeout: 15000 });
+      session.recordNavigation(page.url());
       return `Forward → ${page.url()}`;
     }
 
@@ -172,6 +185,7 @@ export async function handleWriteCommand(
       if (inFrame) throw new Error('Cannot use reload inside a frame. Run \'frame main\' first.');
       session.clearLoadedHtml();
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+      session.recordNavigation(page.url());
       return `Reloaded ${page.url()}`;
     }
 

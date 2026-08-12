@@ -171,11 +171,16 @@ export class TabSession {
    * then clicked a link would silently revert to the original HTML on the next
    * viewport --scale.
    */
-  onMainFrameNavigated(): void {
+  onMainFrameNavigated(url?: string): void {
     this.clearRefs();
     this.activeFrame = null;
     this.loadedHtml = null;
     this.loadedHtmlWaitUntil = undefined;
+    // Follow organic navigation (clicks, redirects) so the nav-guard's
+    // cross-origin check tracks where the tab legitimately went. Deliberately
+    // does NOT bump gotosSinceRead — that counter measures *explicit* navigation
+    // commands, and it is the signal that distinguishes a clobber from a click.
+    if (url && this.lastGotoUrl !== null) this.lastGotoUrl = url;
   }
 
   // ─── Loaded HTML (load-html replay) ───────────────────────
@@ -194,6 +199,11 @@ export class TabSession {
     await this.page.setContent(html, { waitUntil, timeout: 15000 });
     this.loadedHtml = html;
     this.loadedHtmlWaitUntil = waitUntil;
+    // Injected content has no requested-URL to be checked against, and
+    // setContent leaves page.url() on the pre-existing URL. Clearing here
+    // (rather than at each load-html call site) keeps the nav-guard's
+    // precondition in one place.
+    this.clearNavProvenance();
   }
 
   /** Get stored HTML + waitUntil for state replay. Returns null if no load-html happened. */
@@ -206,5 +216,62 @@ export class TabSession {
   clearLoadedHtml(): void {
     this.loadedHtml = null;
     this.loadedHtmlWaitUntil = undefined;
+  }
+
+  // ─── Navigation provenance (silent-wrong-page guard) ──────
+  //
+  // `goto` and `text` are separate HTTP requests from separate CLI
+  // processes. handleCommandInternalImpl is async, so two requests
+  // interleave freely at their await points — the "Bun is single-threaded
+  // so there is no concurrency" assumption at server.ts is false for
+  // anything that spans more than one request. When two agents share a
+  // tab, agent B's goto lands between agent A's goto and A's read, and A
+  // silently receives B's page with a correct-looking `source:` banner.
+  //
+  // These two fields let the read path prove the page still belongs to
+  // the goto that preceded it:
+  //
+  //   lastGotoUrl     — URL the last goto on THIS tab actually committed to
+  //   gotosSinceRead  — gotos since the last page-content read. >1 is the
+  //                     clobber signature (goto, goto, read) and means at
+  //                     least one navigation was thrown away unread.
+  private lastGotoUrl: string | null = null;
+  private gotosSinceRead = 0;
+
+  /**
+   * Record an explicit `goto`. `url` must be page.url() AFTER the nav settles.
+   *
+   * Only `goto` bumps the counter. `back`/`forward`/`reload` use
+   * recordNavigation() instead — they are one caller continuing with one page,
+   * not a second caller racing for the tab, and counting them made the ordinary
+   * `goto URL; reload; text` sequence refuse itself.
+   */
+  recordGoto(url: string): void {
+    this.lastGotoUrl = url;
+    this.gotosSinceRead++;
+  }
+
+  /**
+   * Record a caller-initiated navigation that is NOT a fresh page request:
+   * back, forward, reload. Moves the expectation to the new URL but leaves the
+   * unread-navigation counter alone, so these can't trip the clobber check.
+   */
+  recordNavigation(url: string): void {
+    this.lastGotoUrl = url;
+  }
+
+  /** Record that a page-content read consumed the current navigation. */
+  recordContentRead(): void {
+    this.gotosSinceRead = 0;
+  }
+
+  getNavProvenance(): { lastGotoUrl: string | null; gotosSinceRead: number } {
+    return { lastGotoUrl: this.lastGotoUrl, gotosSinceRead: this.gotosSinceRead };
+  }
+
+  /** Forget provenance — no goto expectation applies to what's now in the tab. */
+  clearNavProvenance(): void {
+    this.lastGotoUrl = null;
+    this.gotosSinceRead = 0;
   }
 }

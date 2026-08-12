@@ -79,10 +79,25 @@ export const DOM_CONTENT_COMMANDS = new Set([
   'media', 'data', 'ux-audit',
 ]);
 
+/**
+ * Make a page-controlled URL safe to embed in agent-facing text.
+ *
+ * A page picks its own URL via history.pushState, so any URL read off the page
+ * is attacker-controlled: newlines could forge envelope markers, and an
+ * arbitrarily long path is a free text channel. Strip and truncate.
+ *
+ * Shared so every agent-facing surface applies the SAME rule — the envelope
+ * below and the nav-guard's 409 errors both embed page URLs, and a second copy
+ * of this logic would be free to drift.
+ */
+export function sanitizePageUrl(url: string): string {
+  return url.replace(/[\n\r]/g, '').slice(0, 200);
+}
+
 /** Wrap output from untrusted-content commands with trust boundary markers */
 export function wrapUntrustedContent(result: string, url: string): string {
   // Sanitize URL: remove newlines to prevent marker injection via history.pushState
-  const safeUrl = url.replace(/[\n\r]/g, '').slice(0, 200);
+  const safeUrl = sanitizePageUrl(url);
   // Escape marker strings in content to prevent boundary escape attacks
   const safeResult = result.replace(/--- (BEGIN|END) UNTRUSTED EXTERNAL CONTENT/g, '--- $1 UNTRUSTED EXTERNAL C\u200BONTENT');
   return `--- BEGIN UNTRUSTED EXTERNAL CONTENT (source: ${safeUrl}) ---\n${safeResult}\n--- END UNTRUSTED EXTERNAL CONTENT ---`;
@@ -91,7 +106,7 @@ export function wrapUntrustedContent(result: string, url: string): string {
 export const COMMAND_DESCRIPTIONS: Record<string, { category: string; description: string; usage?: string }> = {
   // Navigation
   'memory':  { category: 'Server', description: 'Snapshot Bun heap + per-tab JS heap + Chromium process tree + bounded buffer sizes. JSON output with --json.', usage: 'memory [--json]' },
-  'goto':    { category: 'Navigation', description: 'Navigate to URL (http://, https://, or file:// scoped to cwd/TEMP_DIR)', usage: 'goto <url>' },
+  'goto':    { category: 'Navigation', description: 'Navigate to URL (http://, https://, or file:// scoped to cwd/TEMP_DIR). Reports the URL actually landed on, noting any redirect. If a concurrent agent replaces the page before your read, page-content reads 409 rather than return the wrong page.', usage: 'goto <url>' },
   'load-html': { category: 'Navigation', description: 'Load HTML via setContent. Accepts a file path under safe-dirs (validated), OR --from-file <payload.json> with {"html":"...","waitUntil":"..."} for large inline HTML (Windows argv safe).', usage: 'load-html <file> [--wait-until load|domcontentloaded|networkidle] [--tab-id <N>]  |  load-html --from-file <payload.json> [--tab-id <N>]' },
   'back':    { category: 'Navigation', description: 'History back' },
   'forward': { category: 'Navigation', description: 'History forward' },
