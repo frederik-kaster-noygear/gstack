@@ -1,10 +1,21 @@
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterAll } from 'bun:test';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
 const TMP_HOME = path.join(os.tmpdir(), `gstack-test-${process.pid}-${Date.now()}`);
+// Restored in afterAll: Bun runs test files sequentially in one process, so an
+// unrestored write here leaks into every file loaded afterwards. GSTACK_HOME
+// outranks both $HOME and GSTACK_STATE_DIR in the gstack bin scripts, so the
+// leak silently redirects any later test that spawns one.
+const PRIOR_GSTACK_HOME = process.env.GSTACK_HOME;
 process.env.GSTACK_HOME = TMP_HOME;
+
+afterAll(async () => {
+  if (PRIOR_GSTACK_HOME === undefined) delete process.env.GSTACK_HOME;
+  else process.env.GSTACK_HOME = PRIOR_GSTACK_HOME;
+  await fs.rm(TMP_HOME, { recursive: true, force: true });
+});
 
 // Re-import after env var set so module reads updated GSTACK_HOME
 async function freshImport() {
