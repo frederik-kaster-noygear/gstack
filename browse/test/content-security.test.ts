@@ -323,7 +323,11 @@ describe('Centralized wrapping', () => {
   });
 
   test('root tokens get basic wrapping (backward compat)', () => {
-    expect(SERVER_SRC).toContain('wrapUntrustedContent(result, browserManager.getCurrentUrl())');
+    // The banner URL comes from tabUrl() — this request's own tab — not from
+    // browserManager.getCurrentUrl(), which resolves the global activeTabId and
+    // would stamp a concurrent request's address onto this tab's content.
+    // See nav-guard.ts and the read-path wiring tests in nav-guard.test.ts.
+    expect(SERVER_SRC).toContain('wrapUntrustedContent(result, tabUrl())');
   });
 
   test('attrs is in PAGE_CONTENT_COMMANDS', () => {

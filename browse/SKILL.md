@@ -894,6 +894,27 @@ $B cleanup --ads --cookies       # selective cleanup
 $B prettyscreenshot --cleanup --scroll-to ".pricing" --width 1440 ~/Desktop/hero.png
 ```
 
+## Running several agents at once
+
+One browse daemon serves every agent in a git repo, and they all share **one
+tab**. `goto` and `text` are separate processes, so another agent's `goto` can
+land in between and you would read *their* page:
+
+```
+agent A: $B goto https://example.com/a     # ok
+agent B: $B goto https://other.com/b       # same tab — clobbers A
+agent A: $B text                           # would have returned other.com/b
+```
+
+**This now fails loudly instead of lying.** When the tab is not on the page your
+`goto` committed to, page-content commands return a `409` naming both URLs
+rather than handing back the wrong site's text. `goto` also reports the URL it
+*actually* landed on, so a redirect is visible in its output.
+
+There is no per-agent tab isolation yet, so the guard is a detector, not a fix:
+if you see repeated `Refusing to run ...` errors, run your browse agents one at
+a time rather than in parallel.
+
 ## Full Command List
 
 ### Navigation
@@ -901,7 +922,7 @@ $B prettyscreenshot --cleanup --scroll-to ".pricing" --width 1440 ~/Desktop/hero
 |---------|-------------|
 | `back` | History back |
 | `forward` | History forward |
-| `goto <url>` | Navigate to URL (http://, https://, or file:// scoped to cwd/TEMP_DIR) |
+| `goto <url>` | Navigate to URL (http://, https://, or file:// scoped to cwd/TEMP_DIR). Reports the URL actually landed on, noting any redirect. If a concurrent agent replaces the page before your read, page-content reads 409 rather than return the wrong page. |
 | `load-html <file> [--wait-until load|domcontentloaded|networkidle] [--tab-id <N>]  |  load-html --from-file <payload.json> [--tab-id <N>]` | Load HTML via setContent. Accepts a file path under safe-dirs (validated), OR --from-file <payload.json> with {"html":"...","waitUntil":"..."} for large inline HTML (Windows argv safe). |
 | `reload` | Reload page |
 | `url` | Print current URL |

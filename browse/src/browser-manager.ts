@@ -1708,7 +1708,11 @@ export class BrowserManager {
         // Find the TabSession for this page and clear its per-tab state
         for (const session of this.tabSessions.values()) {
           if (session.page === page) {
-            session.onMainFrameNavigated();
+            // Pass the new URL so nav provenance tracks organic navigation
+            // (link clicks, JS/meta redirects, OAuth hops) as well as explicit
+            // goto. Without this the nav-guard would false-positive on the
+            // legitimate `goto site; click external-link; text` flow.
+            session.onMainFrameNavigated(frame.url());
             break;
           }
         }

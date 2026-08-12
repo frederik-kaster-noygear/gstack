@@ -123,7 +123,7 @@ Run with `browse <command> [args]`. Full reference: `browse/SKILL.md`.
 ### Navigation
 - `back`: History back
 - `forward`: History forward
-- `goto <url>`: Navigate to URL (http://, https://, or file:// scoped to cwd/TEMP_DIR)
+- `goto <url>`: Navigate to URL (http://, https://, or file:// scoped to cwd/TEMP_DIR).
 - `load-html <file> [--wait-until load|domcontentloaded|networkidle] [--tab-id <N>]  |  load-html --from-file <payload.json> [--tab-id <N>]`: Load HTML via setContent.
 - `reload`: Reload page
 - `url`: Print current URL
