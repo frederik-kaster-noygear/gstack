@@ -17,12 +17,18 @@ function logPath(): string {
   return path.join(home, "security", "semantic-reviews.jsonl");
 }
 
+// Captured at module load, before any beforeEach overwrites it.
+const PRIOR_GSTACK_HOME = process.env.GSTACK_HOME;
+
 beforeEach(() => {
   home = fs.mkdtempSync(path.join(os.tmpdir(), "audit-"));
   process.env.GSTACK_HOME = home;
 });
 afterEach(() => {
-  delete process.env.GSTACK_HOME;
+  // Restore rather than delete: an unconditional delete drops a GSTACK_HOME
+  // the developer (or an earlier file) legitimately had set.
+  if (PRIOR_GSTACK_HOME === undefined) delete process.env.GSTACK_HOME;
+  else process.env.GSTACK_HOME = PRIOR_GSTACK_HOME;
   fs.rmSync(home, { recursive: true, force: true });
 });
 

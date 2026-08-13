@@ -15,9 +15,21 @@ function mkTmpDir(): string {
 
 function run(cmd: string, opts: { cwd?: string; env?: Record<string, string> } = {}): { stdout: string; stderr: string; exitCode: number } {
   try {
+    // gstack-session-update reads GSTACK_STATE_DIR but shells out to
+    // gstack-config, which ranks GSTACK_STATE_ROOT > GSTACK_HOME above it, so a
+    // GSTACK_HOME leaked by another test file would outrank the caller's pin.
+    // Only callers that isolate a state dir get the extra pins; the other calls
+    // in this file deliberately run against the ambient env.
+    const stateDir = opts.env?.GSTACK_STATE_DIR;
     const stdout = execSync(cmd, {
       cwd: opts.cwd,
-      env: { ...process.env, ...opts.env },
+      env: {
+        ...process.env,
+        ...opts.env,
+        ...(stateDir
+          ? { GSTACK_HOME: stateDir, GSTACK_STATE_ROOT: stateDir }
+          : {}),
+      },
       encoding: 'utf-8',
       timeout: 10000,
     });

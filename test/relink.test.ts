@@ -22,18 +22,28 @@ let skillsDir: string;
 let installDir: string;
 
 function run(cmd: string, env: Record<string, string> = {}, expectFail = false): string {
+  // gstack-relink reads GSTACK_STATE_DIR, but it shells out to gstack-config,
+  // which ranks GSTACK_STATE_ROOT > GSTACK_HOME above it. A GSTACK_HOME leaked
+  // by another test file therefore outranks GSTACK_STATE_DIR, sending the
+  // `config set` in one test to a directory that survives into the next one —
+  // a wrong-value failure, not an error. Pin all three precedence levels to the
+  // same dir, after the env spread so a deliberate override still decides it.
+  const dir = env.GSTACK_STATE_DIR ?? tmpDir;
   try {
     return execSync(cmd, {
       cwd: ROOT,
-      // A sibling test file in the same shard PROCESS can leave GSTACK_HOME
-      // set on process.env; relink/config children must resolve state ONLY
-      // via the dirs this test passes (observed: 'fresh install' test saw a
-      // neighbor's skill_prefix and produced prefixed names).
-      env: (() => {
-        const child: Record<string, string | undefined> = { ...process.env, GSTACK_STATE_DIR: tmpDir, ...env };
-        if (!('GSTACK_HOME' in env)) delete child.GSTACK_HOME;
-        return child;
-      })(),
+      // Pinning all three (rather than deleting the higher-precedence ones)
+      // also covers GSTACK_STATE_ROOT, which outranks GSTACK_STATE_DIR and
+      // would otherwise still leak in from a sibling file in the same shard
+      // process (observed: 'fresh install' saw a neighbor's skill_prefix and
+      // produced prefixed names).
+      env: {
+        ...process.env,
+        ...env,
+        GSTACK_STATE_DIR: dir,
+        GSTACK_HOME: dir,
+        GSTACK_STATE_ROOT: dir,
+      },
       encoding: 'utf-8',
       timeout: 10000,
       stdio: ['pipe', 'pipe', 'pipe'],
