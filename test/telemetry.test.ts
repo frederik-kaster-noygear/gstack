@@ -15,12 +15,18 @@ let tmpDir: string;
 const FIXTURE_SUPABASE_URL = 'https://telemetry.fixture.invalid';
 
 function run(cmd: string, env: Record<string, string> = {}): string {
+  // gstack-telemetry-log reads GSTACK_STATE_DIR, but it (and setConfig below)
+  // shells out to gstack-config, which ranks GSTACK_STATE_ROOT > GSTACK_HOME
+  // above it. A GSTACK_HOME leaked by another test file would outrank this pin
+  // and send the `config set` to a different directory. Pin all three, after
+  // the env spread so a deliberate override still decides the dir.
+  const dir = env.GSTACK_STATE_DIR ?? tmpDir;
   return execSync(cmd, {
     cwd: ROOT,
     env: {
       ...process.env,
       HOME: path.join(tmpDir, 'home'),
-      GSTACK_STATE_DIR: tmpDir, GSTACK_STATE_ROOT: tmpDir, GSTACK_HOME: tmpDir,
+      GSTACK_STATE_DIR: dir, GSTACK_STATE_ROOT: dir, GSTACK_HOME: dir,
       GSTACK_DIR: ROOT, GSTACK_SUPABASE_URL: FIXTURE_SUPABASE_URL,
       GSTACK_SUPABASE_ANON_KEY: 'fixture-anon-key',
       GSTACK_TEST_CURL_ARGS: path.join(tmpDir, 'curl-args'),
