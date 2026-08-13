@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.62.1.0] - 2026-08-13
+
+## **A browse daemon could corrupt a browser it never opened.**
+## **Shutdown now cleans up only what it owns.**
+
+Run gstack from two git worktrees with a headed browser open, and the second one's daemon could delete the first one's Chromium profile locks on its way out. It did that even when it had never launched a browser at all, because shutdown cleaned whatever profile the environment happened to resolve to, with no check that this process owned it. Those lock files are what stop a second Chromium attaching to a profile already in use. Delete them and two browsers write one profile, which is the documented route to profile corruption. Shutdown now cleans singleton locks only for a profile it actually launched into.
+
+### The numbers that matter
+
+Source: reproduced on Linux with throwaway profiles, running a real browse daemon with `BROWSE_HEADLESS_SKIP=1` while a live headed Chromium held the same profile.
+
+| What | Before | After |
+|------|--------|-------|
+| Singleton locks surviving an unrelated daemon's shutdown | 0 of 3 | 3 of 3 |
+| Chromium processes on one profile after a second launch | 16 | 8 |
+| Second launch against an in-use profile | starts anyway | refused |
+| Shutdown paths that delete locks without checking ownership | 2 | 0 |
+| Static tripwires pinning the invariant | 0 | 2 |
+
+That 16 is the whole bug in one number. Chromium is built to abort the second launch, and says so: "Aborting now to avoid profile corruption." Removing the locks removes that protection, so both instances start and then fight over one profile, logging "database is locked" and "Unable to open the password store database" as they go.
+
+### What this means for you
+
+If you run several worktrees or agent sessions against a headed browser, a shutdown in one no longer takes out another's live session, and you no longer lose logged-in state to a profile that two Chromiums scribbled on at once. Nothing to configure. Two paths still clean the shared profile without an ownership check, both by design and both now written down in CLAUDE.md: the pre-launch clean in `launchHeaded()`, and the `killOrphanChromium()` / `cleanChromiumProfileLocks()` pair in `cli.ts` that #1781 added.
+
+### Itemized changes
+
+#### Fixed
+
+- Shutdown-path cleanup of `Singleton{Lock,Socket,Cookie}` is gated on profile ownership. `BrowserManager` records the profile it launched into at both `chromium.launchPersistentContext()` sites and releases the record only when `close()` closes the context cleanly, since Chromium removes its own locks then. A close that timed out or threw keeps the record, so genuinely stale locks are still cleared. `emergencyCleanup()` and `shutdown()` in `browse/src/server.ts` call `BrowserManager.cleanOwnedSingletonLocks()`, which no-ops without ownership.
+- Shutdown no longer re-resolves the profile from the environment at exit time, so it cannot act on a different directory than the one the browser was launched into.
+
+#### For contributors
+
+- `browse/test/singleton-lock-ownership.test.ts` adds unit coverage for the ownership gate and both directions of the `close()` clean-versus-timeout release, plus two static tripwires: `server.ts` must not import `cleanSingletonLocks` / `resolveChromiumProfile`, and every `launchPersistentContext` site must record ownership inside its own method. Both tripwires were checked by mutating the source and confirming they fail.
+- `ServerConfig.chromiumProfile` is documented as unimplemented. Nothing reads it, so setting it is a silent no-op and callers must use the `CHROMIUM_PROFILE` environment variable.
+- The `cleanSingletonLocks` docstring no longer claims the CLI single-instance check establishes its precondition. That check is per-project while the profile is machine-global.
+
 ## [1.62.0.0] - 2026-08-12
 
 ## **Plan reviews stop asking what to review when you're in plan mode.**
