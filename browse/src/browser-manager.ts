@@ -197,6 +197,20 @@ export class BrowserManager {
   private connectionMode: 'launched' | 'headed' = 'launched';
   private intentionalDisconnect = false;
 
+  // ─── Persistent-Profile Ownership ────────────────────────
+  // The persistent Chromium profile THIS manager actually launched a browser
+  // into, or null if it never did. Set at the two launchPersistentContext
+  // sites (launchHeaded, handoff); cleared when close() cleanly closes the
+  // context. Headless launch() uses an ephemeral profile, so it never sets it.
+  //
+  // This is the ownership record that gates shutdown-path singleton-lock
+  // cleanup. SingletonLock/Socket/Cookie are Chromium's ProcessSingleton —
+  // the mechanism that stops a second Chromium attaching to a user-data-dir
+  // already in use ("Aborting now to avoid profile corruption"). Deleting a
+  // live peer's locks removes that protection, so only the process that
+  // created them may delete them.
+  private ownedProfileDir: string | null = null;
+
   // ─── Tab Count Guardrail (D5 + Codex single-tab flag) ───────
   // Idempotent threshold trackers: each guardrail fires exactly once per
   // upward crossing of its threshold and re-arms when the tab count drops
@@ -253,6 +267,29 @@ export class BrowserManager {
   public onDisconnect: ((exitCode?: number) => void | Promise<void>) | null = null;
 
   getConnectionMode(): 'launched' | 'headed' { return this.connectionMode; }
+
+  /** The persistent profile this manager launched into, or null. For tests. */
+  getOwnedProfileDir(): string | null { return this.ownedProfileDir; }
+
+  /**
+   * Shutdown-path cleanup of the singleton lockfiles for the profile THIS
+   * manager launched a browser into. No-op when this process never took
+   * ownership — BROWSE_HEADLESS_SKIP=1, a launch that threw, headless-only
+   * mode, or a context we already closed cleanly (Chromium removes the locks
+   * itself on a clean close).
+   *
+   * The ownership gate is the point: shutdown used to clean whatever
+   * resolveChromiumProfile() happened to resolve at exit time, so a daemon
+   * that never opened a browser would delete a *different, still-running*
+   * browser's locks and let a second Chromium attach to that profile.
+   *
+   * Cleaning is still correct when close() timed out or failed: the locks are
+   * then ours and stale, and they would otherwise block the next launch.
+   */
+  cleanOwnedSingletonLocks(): void {
+    if (!this.ownedProfileDir) return;
+    cleanSingletonLocks(this.ownedProfileDir);
+  }
 
   // ─── Watch Mode Methods ─────────────────────────────────
   isWatching(): boolean { return this.watching; }
@@ -492,8 +529,17 @@ export class BrowserManager {
     // ProcessSingleton refuses to start when these exist from a prior crash
     // (SIGKILL, hard crash) — the lockfiles point at a PID that may no longer
     // exist. Shutdown cleanup doesn't run on hard crashes, so we clean here
-    // too. Safe under external coordination: gbd.lock for gbrowser,
-    // single-instance CLI check for gstack.
+    // too.
+    //
+    // This is the one carve-out cleanSingletonLocks documents: cleaning
+    // immediately before launching into the profile ourselves. gbrowser adds
+    // gbd.lock on top. Do NOT read this as "the CLI single-instance check makes
+    // it safe" — that check is per-project while the profile is machine-global
+    // (see cleanSingletonLocks' docstring), so a live browser from another
+    // project can still hold these locks. The residual risk is that we delete
+    // them and launch anyway instead of letting Chromium refuse; gating this on
+    // lock staleness (is the PID in the SingletonLock symlink still alive?) is
+    // tracked separately.
     cleanSingletonLocks(userDataDir);
 
     // Support custom Chromium binary via GSTACK_CHROMIUM_PATH env var.
@@ -592,6 +638,9 @@ export class BrowserManager {
     this.browser = this.context.browser();
     this.connectionMode = 'headed';
     this.intentionalDisconnect = false;
+    // We now hold this profile's ProcessSingleton — record it so shutdown
+    // cleans these locks and only these.
+    this.ownedProfileDir = userDataDir;
 
     // ─── Anti-bot-detection patches ───────────────────────────────
     // Apply Layer C stealth (applyStealth): masks navigator.webdriver,
@@ -728,10 +777,17 @@ export class BrowserManager {
         // Headed/persistent context mode: close the context (which closes the browser)
         this.intentionalDisconnect = true;
         if (this.browser) this.browser.removeAllListeners('disconnected');
-        await Promise.race([
-          this.context ? this.context.close() : Promise.resolve(),
-          new Promise(resolve => setTimeout(resolve, 5000)),
-        ]).catch(() => {});
+        // Distinguish a clean close from a timeout/failure. On a clean close
+        // Chromium removes its own SingletonLock/Socket/Cookie and we no
+        // longer hold the profile, so drop the ownership record — otherwise a
+        // later shutdown would delete locks belonging to whoever claims the
+        // profile next. If the close timed out or threw, keep ownership: those
+        // locks are ours and stale, and shutdown still needs to clear them.
+        const closedCleanly = await Promise.race([
+          (this.context ? this.context.close() : Promise.resolve()).then(() => true),
+          new Promise<boolean>(resolve => setTimeout(() => resolve(false), 5000)),
+        ]).catch(() => false);
+        if (closedCleanly) this.ownedProfileDir = null;
       } else {
         // Launched mode: close the browser we spawned
         this.browser.removeAllListeners('disconnected');
@@ -1587,6 +1643,9 @@ export class BrowserManager {
         ignoreDefaultArgs: STEALTH_IGNORE_DEFAULT_ARGS,
         timeout: 15000,
       });
+      // Handoff took this profile's ProcessSingleton — same ownership record
+      // launchHeaded() writes, so shutdown cleans these locks and only these.
+      this.ownedProfileDir = userDataDir;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return `ERROR: Cannot open headed browser — ${msg}. Headless browser still running.`;
@@ -1639,8 +1698,12 @@ export class BrowserManager {
         `STATUS: Waiting for user. Run 'resume' when done.`,
       ].join('\n');
     } catch (err: unknown) {
-      // Restore failed — close the new context, keep old state
+      // Restore failed — close the new context, keep old state. The close
+      // releases the ProcessSingleton, so drop the ownership record too;
+      // otherwise shutdown would later delete locks held by whoever claims
+      // the profile next.
       await newContext.close().catch(() => {});
+      this.ownedProfileDir = null;
       const msg = err instanceof Error ? err.message : String(err);
       return `ERROR: Handoff failed during state restore — ${msg}. Headless browser still running.`;
     }

@@ -406,6 +406,11 @@ function makeMockBrowserManager(mode: 'launched' | 'headed') {
     isWatching: () => false,
     stopWatch: () => {},
     close: async () => {},
+    // shutdown() cleans singleton lockfiles through the manager so the
+    // ownership gate (only the process that launched the browser may delete
+    // its locks) can't be bypassed. A mock standing in for cfg.browserManager
+    // has to cover the whole shutdown surface, same as close/isWatching.
+    cleanOwnedSingletonLocks: () => {},
     onDisconnect: null as ((code?: number) => void | Promise<void>) | null,
   };
 }
