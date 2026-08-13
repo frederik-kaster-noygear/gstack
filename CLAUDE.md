@@ -335,6 +335,26 @@ Three sites migrated: cdp-bridge frame events, write-commands archive capture,
 cdp-inspector. The helpers prevent the per-session leak class where successful-path
 detach happened but error-path detach was missed.
 
+**Chromium singleton-lock ownership** (v1.62.1.0+). Shutdown-path cleanup of
+`Singleton{Lock,Socket,Cookie}` MUST go through
+`BrowserManager.cleanOwnedSingletonLocks()`, never
+`cleanSingletonLocks(resolveChromiumProfile())`. The manager records the profile
+it actually launched into at both `chromium.launchPersistentContext()` sites and
+releases that record only when `close()` closes the context cleanly (Chromium
+removes its own locks then), so a close that timed out still clears locks that
+really are ours. The gate matters because the profile is machine-global
+(`~/.gstack/chromium-profile`) while the CLI single-instance lock is per-project:
+an ungated delete takes out a *different, still-running* browser's locks, which
+removes the ProcessSingleton guard that makes a second instance abort ("Aborting
+now to avoid profile corruption") and lets two Chromiums write one user-data-dir.
+`browse/test/singleton-lock-ownership.test.ts` pins it with two static tripwires —
+`server.ts` must not import `cleanSingletonLocks`/`resolveChromiumProfile`, and
+every `launchPersistentContext` site must record ownership inside its own method.
+Two paths are deliberately NOT covered: the pre-launch clean in `launchHeaded()`
+(it runs immediately before this process takes the profile) and the
+`killOrphanChromium()`/`cleanChromiumProfileLocks()` pair in `cli.ts` (#1781),
+which still act on the global profile with no ownership check.
+
 **Setup symlink hardening** (v1.38.0.0+). Every link site in `setup` MUST route
 through the `_link_or_copy SRC DST` helper near the `IS_WINDOWS` detection. On
 Windows without Developer Mode, plain `ln -snf` produces frozen file copies that
