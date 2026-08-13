@@ -329,11 +329,14 @@ body
 // ── withErrorContext ───────────────────────────────────────────────────────
 
 describe("withErrorContext", () => {
-  let savedHome: string | undefined;
+  // Captured at collection time, before any beforeEach has run. Saving inside
+  // beforeEach instead would re-read GSTACK_HOME after the previous test
+  // already overwrote it, so afterAll would "restore" a stale temp dir and
+  // leak it to every later test file in the shared bun process.
+  const savedHome = process.env.GSTACK_HOME;
   let testHome: string;
 
   beforeEach(() => {
-    savedHome = process.env.GSTACK_HOME;
     testHome = mkdtempSync(join(tmpdir(), "gstack-test-home-"));
     process.env.GSTACK_HOME = testHome;
   });
@@ -392,18 +395,17 @@ describe("withErrorContext", () => {
 // ── detectEngineTier ───────────────────────────────────────────────────────
 
 describe("detectEngineTier", () => {
-  let savedHome: string | undefined;
-  let savedGbrainHome: string | undefined;
-  let savedRealHome: string | undefined;
-  let savedPath: string | undefined;
+  // Captured at collection time — see the note in withErrorContext above.
+  // Saving these inside beforeEach makes afterAll restore the *previous
+  // test's* temp dirs rather than the real values.
+  const savedHome = process.env.GSTACK_HOME;
+  const savedGbrainHome = process.env.GBRAIN_HOME;
+  const savedRealHome = process.env.HOME;
+  const savedPath = process.env.PATH;
   let testHome: string;
   let testGbrainHome: string;
 
   beforeEach(() => {
-    savedHome = process.env.GSTACK_HOME;
-    savedGbrainHome = process.env.GBRAIN_HOME;
-    savedRealHome = process.env.HOME;
-    savedPath = process.env.PATH;
     testHome = mkdtempSync(join(tmpdir(), "gstack-test-engine-"));
     testGbrainHome = mkdtempSync(join(tmpdir(), "gstack-test-gbrain-"));
     process.env.GSTACK_HOME = testHome;

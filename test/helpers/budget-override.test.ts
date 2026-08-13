@@ -8,14 +8,24 @@
  * timestamp + scope + reason + CI provenance.
  */
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { logBudgetOverride } from './budget-override';
 
 const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'budget-override-test-'));
+// Set at module load because the logger resolves GSTACK_HOME on first call, so
+// it has to be in place before the import above is exercised. Restore in
+// afterAll (not afterEach — these tests need the value for their whole run):
+// bun shares one process across test files, so without this the temp dir leaks
+// into every file that runs afterwards.
+const PRIOR_GSTACK_HOME = process.env.GSTACK_HOME;
 process.env.GSTACK_HOME = TMP_HOME;
+afterAll(() => {
+  if (PRIOR_GSTACK_HOME === undefined) delete process.env.GSTACK_HOME;
+  else process.env.GSTACK_HOME = PRIOR_GSTACK_HOME;
+});
 const AUDIT_PATH = path.join(TMP_HOME, 'analytics', 'spend-overrides.jsonl');
 
 describe('logBudgetOverride', () => {

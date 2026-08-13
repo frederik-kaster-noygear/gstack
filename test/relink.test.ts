@@ -22,10 +22,23 @@ let skillsDir: string;
 let installDir: string;
 
 function run(cmd: string, env: Record<string, string> = {}, expectFail = false): string {
+  // gstack-relink reads GSTACK_STATE_DIR, but it shells out to gstack-config,
+  // which ranks GSTACK_STATE_ROOT > GSTACK_HOME above it. A GSTACK_HOME leaked
+  // by another test file therefore outranks GSTACK_STATE_DIR, sending the
+  // `config set` in one test to a directory that survives into the next one —
+  // a wrong-value failure, not an error. Pin all three precedence levels to the
+  // same dir, after the env spread so a deliberate override still decides it.
+  const dir = env.GSTACK_STATE_DIR ?? tmpDir;
   try {
     return execSync(cmd, {
       cwd: ROOT,
-      env: { ...process.env, GSTACK_STATE_DIR: tmpDir, ...env },
+      env: {
+        ...process.env,
+        ...env,
+        GSTACK_STATE_DIR: dir,
+        GSTACK_HOME: dir,
+        GSTACK_STATE_ROOT: dir,
+      },
       encoding: 'utf-8',
       timeout: 10000,
       stdio: ['pipe', 'pipe', 'pipe'],
