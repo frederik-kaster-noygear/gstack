@@ -25,7 +25,7 @@ import {
   runContentFilters, type ContentFilterResult,
   markHiddenElements, getCleanTextWithStripping, cleanupHiddenMarkers,
 } from './content-security';
-import { generateCanary, injectCanary, getStatus as getSecurityStatus, writeDecision } from './security';
+import { generateCanary, injectCanary, writeDecision } from './security';
 import { isSidecarAvailable, scanWithSidecar } from './security-sidecar-client';
 import { writeSecureFile, mkdirSecure } from './file-permissions';
 import { handleSnapshot, SNAPSHOT_FLAGS } from './snapshot';
@@ -1789,12 +1789,13 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
           // surface. Keep `chatEnabled: false` so any older extension
           // build still treats the chat input as disabled.
           chatEnabled: false,
-          // Security module status — drives the shield icon in the sidepanel.
-          // Returns {status: 'protected'|'degraded'|'inactive', layers: {...}}.
-          // The chat-path classifier no longer feeds this since
-          // sidebar-agent.ts was ripped; only the page-content side
-          // (canary, content-security) keeps reporting in.
-          security: getSecurityStatus(),
+          // No `security` field: the only writer of the status it reported
+          // (sidebar-agent.ts) went away with the chat path, so it read from
+          // a session-state file nothing wrote — reporting a permanent
+          // 'inactive', or a stale 'protected' wherever an old state file
+          // survived. The live defenses (canary, content-security L1-L3, the
+          // L4 sidecar on /pty-inject-scan) report through their own call
+          // sites, not through /health.
           // Terminal-agent discovery. ONLY a port number — never a token.
           // Tokens flow via the /pty-session HttpOnly cookie path. See
           // `pty-session-cookie.ts` for the rationale (codex outside-voice

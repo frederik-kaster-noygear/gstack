@@ -16,9 +16,6 @@ import {
   checkCanaryInStructure,
   hashPayload,
   logAttempt,
-  writeSessionState,
-  readSessionState,
-  getStatus,
   extractDomain,
   buildTelemetrySpawnCommand,
   resolveBashBinary,
@@ -277,40 +274,6 @@ describe('logAttempt', () => {
     expect(last.urlDomain).toBe('example.com');
     expect(last.payloadHash).toBe('deadbeef');
     expect(last.verdict).toBe('block');
-  });
-});
-
-// ─── Session state (cross-process, atomic) ───────────────────
-
-describe('session state', () => {
-  test('write + read round-trip', () => {
-    const state = {
-      sessionId: 'test-session-123',
-      canary: 'CANARY-TEST',
-      warnedDomains: ['example.com'],
-      classifierStatus: { testsavant: 'ok' as const, transcript: 'ok' as const },
-      lastUpdated: '2026-04-19T12:34:56Z',
-    };
-    writeSessionState(state);
-    const got = readSessionState();
-    expect(got).not.toBeNull();
-    expect(got!.sessionId).toBe('test-session-123');
-    expect(got!.canary).toBe('CANARY-TEST');
-    expect(got!.warnedDomains).toEqual(['example.com']);
-  });
-});
-
-// ─── Status reporting for shield icon ────────────────────────
-
-describe('getStatus', () => {
-  test('returns a valid SecurityStatus shape', () => {
-    const s = getStatus();
-    expect(['protected', 'degraded', 'inactive']).toContain(s.status);
-    expect(s.layers).toBeDefined();
-    expect(['ok', 'degraded', 'off']).toContain(s.layers.testsavant);
-    expect(['ok', 'degraded', 'off']).toContain(s.layers.transcript);
-    expect(['ok', 'off']).toContain(s.layers.canary);
-    expect(s.lastUpdated).toBeTruthy();
   });
 });
 
