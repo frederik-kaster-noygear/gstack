@@ -157,7 +157,9 @@ describe('sidepanel-terminal.js: eager auto-connect + injection API', () => {
   test('forceRestart helper closes ws, disposes xterm, returns to IDLE', () => {
     expect(TERM_JS).toContain('function forceRestart');
     const fn = TERM_JS.slice(TERM_JS.indexOf('function forceRestart'));
-    expect(fn).toContain('ws && ws.close()');
+    // The 4001 code is load-bearing: the close handler treats 1000/4001/4404
+    // as an intentional close and skips the re-attach loop.
+    expect(fn).toContain("ws.close(4001, 'intentional-restart')");
     expect(fn).toContain('term.dispose()');
     expect(fn).toContain('STATE.IDLE');
     expect(fn).toContain('tryAutoConnect()');
@@ -222,8 +224,16 @@ describe('cli.ts: sidebar-agent is no longer spawned', () => {
   });
 
   test('Terminal-agent spawn survives', () => {
-    expect(CLI_SRC).toContain('terminal-agent.ts');
-    expect(CLI_SRC).toMatch(/Bun\.spawn\(\['bun',\s*'run',\s*termAgentScript\]/);
+    // The spawn moved out of cli.ts into the shared spawnTerminalAgent helper
+    // so the CLI cold-start path and the server-side watchdog share one code
+    // path. cli.ts now delegates; the Bun.spawn itself lives in the helper.
+    expect(CLI_SRC).toContain('spawnTerminalAgent');
+    const CTRL_SRC = fs.readFileSync(
+      path.join(import.meta.dir, '../src/terminal-agent-control.ts'),
+      'utf-8',
+    );
+    expect(CTRL_SRC).toContain('terminal-agent.ts');
+    expect(CTRL_SRC).toMatch(/\(Bun as any\)\.spawn\(\['bun',\s*'run',\s*script\]/);
   });
 });
 

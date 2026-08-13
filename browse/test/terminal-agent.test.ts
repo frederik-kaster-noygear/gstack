@@ -152,9 +152,14 @@ describe('Source-level guard: terminal-agent', () => {
     );
     expect(upgradeBlock).not.toContain('spawnClaude(');
     // Spawn must be invoked from the message handler (lazy on first byte).
+    // The direct spawnClaude() call was refactored into the idempotent
+    // maybeSpawnPty helper, shared by the `start` frame and binary-input
+    // paths; the helper is what actually calls spawnClaude.
     const messageHandler = AGENT_SRC.slice(AGENT_SRC.indexOf('message(ws, raw)'));
-    expect(messageHandler).toContain('spawnClaude(');
+    expect(messageHandler).toContain('maybeSpawnPty(');
     expect(messageHandler).toContain('!session.spawned');
+    const spawnHelper = AGENT_SRC.slice(AGENT_SRC.indexOf('function maybeSpawnPty('));
+    expect(spawnHelper).toContain('spawnClaude(');
   });
 
   test('process.on uncaughtException + unhandledRejection handlers exist', () => {

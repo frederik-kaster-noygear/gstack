@@ -798,13 +798,20 @@ export class BrowserManager {
     const page = this.pages.get(tabId);
     if (!page) throw new Error(`Tab ${tabId} not found`);
 
+    // Note this BEFORE closing: the page's own 'close' listener (wirePageEvents)
+    // fires during page.close() and already repoints activeTabId — to 0 when no
+    // tabs remain. Re-reading activeTabId afterwards would never match tabId, so
+    // the auto-create branch below would be dead code and closing the last tab
+    // would leave the browser with zero pages.
+    const wasActive = tabId === this.activeTabId;
+
     await page.close();
     this.pages.delete(tabId);
     this.tabSessions.delete(tabId);
     this.tabOwnership.delete(tabId);
 
     // Switch to another tab if we closed the active one
-    if (tabId === this.activeTabId) {
+    if (wasActive) {
       const remaining = [...this.pages.keys()];
       if (remaining.length > 0) {
         this.activeTabId = remaining[remaining.length - 1];

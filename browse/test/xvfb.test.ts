@@ -62,9 +62,12 @@ describe('isOurXvfb (PID validation)', () => {
   });
 
   test('returns false when cmdline does not contain Xvfb', () => {
-    // Current bun process is not Xvfb. PID-correct, cmdline-wrong → reject.
-    const myStart = readPidStartTime(process.pid);
-    expect(isOurXvfb(process.pid, myStart)).toBe(false);
+    // PID-correct, cmdline-wrong → reject. Use pid 1 (init/systemd) rather
+    // than process.pid: when this file is run on its own, the test runner's
+    // own argv contains "xvfb.test.ts", so the substring check would match
+    // and the test would pass itself for the wrong reason.
+    const initStart = readPidStartTime(1);
+    expect(isOurXvfb(1, initStart)).toBe(false);
   });
 
   test('returns false when start-time differs (PID reuse defense)', () => {
