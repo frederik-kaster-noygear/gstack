@@ -148,7 +148,11 @@ describe('lease lifecycle interplay (via pty-session-lease)', () => {
     const vb = validateLease(b.sessionId);
     expect(va.ok && vb.ok).toBe(true);
     if (va.ok && vb.ok) {
-      expect(va.expiresAt).toBe(vb.expiresAt);
+      // Same TTL policy, not the same wall clock: the two mints can straddle
+      // a millisecond tick under load, so assert closeness rather than
+      // equality. The property under test is that both leases got the same
+      // TTL and neither is coupled to ring-buffer state.
+      expect(Math.abs(va.expiresAt - vb.expiresAt)).toBeLessThanOrEqual(5);
     }
   });
 });
