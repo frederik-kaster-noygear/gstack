@@ -37,7 +37,7 @@ import {
   isRootToken, checkConnectRateLimit, type TokenInfo,
 } from './token-registry';
 import { validateTempPath } from './path-security';
-import { resolveConfig, ensureStateDir, readVersionHash, resolveChromiumProfile, cleanSingletonLocks } from './config';
+import { resolveConfig, ensureStateDir, readVersionHash } from './config';
 import { emitActivity, subscribe, getActivityAfter, getActivityHistory, getSubscriberCount } from './activity';
 import { createSseEndpoint } from './sse-helpers';
 import { initAuditLog, writeAuditEntry } from './audit';
@@ -197,7 +197,14 @@ export interface ServerConfig {
   config: ReturnType<typeof resolveConfig>;
   /** Pre-launched BrowserManager. Caller owns lifecycle. */
   browserManager: BrowserManager;
-  /** Optional Chromium profile path override. Resolved by resolveChromiumProfile(). */
+  /**
+   * Optional Chromium profile path override.
+   *
+   * NOT IMPLEMENTED — nothing reads this field, so setting it is a silent
+   * no-op. BrowserManager calls resolveChromiumProfile() with no explicit
+   * argument, which means embedders must set the CHROMIUM_PROFILE env var
+   * instead. Kept for source compatibility; wire it through before relying on it.
+   */
   chromiumProfile?: string;
   /** Caller-owned. shutdown() does NOT call xvfb.stop(); caller is responsible. */
   xvfb?: XvfbHandle | null;
@@ -1478,9 +1485,15 @@ function emergencyCleanup() {
     }
   } catch { /* state file unparseable — fall through to lock + state cleanup */ }
 
-  // Clean Chromium profile locks via the shared helper (defensive guard
-  // refuses to operate on unrecognized profile dirs).
-  cleanSingletonLocks(resolveChromiumProfile());
+  // Clean Chromium profile locks — but ONLY for a profile this process
+  // actually launched a browser into. The manager owns that record, so the
+  // gate lives there rather than being re-derived here. This path is
+  // precisely where ownership state is least trustworthy (uncaught
+  // exception), which is why it asks the manager instead of re-resolving the
+  // profile from env: a crashing daemon that never opened a browser
+  // (BROWSE_HEADLESS_SKIP=1, or a launch that threw) must not delete the
+  // singleton locks of a different, still-running browser.
+  activeBrowserManager.cleanOwnedSingletonLocks();
   safeUnlinkQuiet(config.stateFile);
 }
 // Same import.meta.main gate as SIGINT/SIGTERM — embedders register their
@@ -1673,7 +1686,11 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
 
     await cfgBrowserManager.close();
 
-    cleanSingletonLocks(resolveChromiumProfile());
+    // Only the profile this daemon actually launched into (see
+    // cleanOwnedSingletonLocks). close() above already cleared the record if
+    // it closed cleanly — Chromium removes its own locks then — so this is
+    // the belt-and-braces path for a close that timed out or threw.
+    cfgBrowserManager.cleanOwnedSingletonLocks();
     safeUnlinkQuiet(config.stateFile);
     process.exit(exitCode);
   }
