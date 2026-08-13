@@ -6,10 +6,25 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { startTestServer } from './test-server';
 import { BrowserManager, type BrowserState } from '../src/browser-manager';
 import { handleWriteCommand as _handleWriteCommand } from '../src/write-commands';
 import { handleMetaCommand } from '../src/meta-commands';
+
+// The handoff path relaunches Chromium with launchPersistentContext against a
+// real on-disk profile. Unpinned that resolves to the developer's actual
+// ~/.gstack/chromium-profile -- verified by capturing --user-data-dir from the
+// live process table during this file's run. That means a test run drives a
+// browser over real cookies and sessions, and cleanSingletonLocks() deletes the
+// profile's Singleton{Lock,Socket,Cookie}, which is precisely what that
+// helper's own contract forbids without external coordination. Basename must
+// stay 'chromium-profile' to satisfy that guard.
+const TMP_PROFILE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-handoff-profile-'));
+const PRIOR_CHROMIUM_PROFILE = process.env.CHROMIUM_PROFILE;
+process.env.CHROMIUM_PROFILE = path.join(TMP_PROFILE_ROOT, 'chromium-profile');
 
 const handleWriteCommand = (cmd: string, args: string[], b: BrowserManager) =>
   _handleWriteCommand(cmd, args, b.getActiveSession(), b);
@@ -32,6 +47,9 @@ afterAll(() => {
   // `bun test browse/test/` run before later files report.
   bm.close().catch(() => {});
   try { testServer.server.stop(); } catch {}
+  if (PRIOR_CHROMIUM_PROFILE === undefined) delete process.env.CHROMIUM_PROFILE;
+  else process.env.CHROMIUM_PROFILE = PRIOR_CHROMIUM_PROFILE;
+  try { fs.rmSync(TMP_PROFILE_ROOT, { recursive: true, force: true }); } catch {}
 });
 
 // ─── Unit Tests: Failure Tracking (no browser needed) ────────────

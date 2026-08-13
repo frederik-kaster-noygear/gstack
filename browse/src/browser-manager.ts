@@ -1568,7 +1568,11 @@ export class BrowserManager {
         console.log('[browse] Handoff: extension not found — headed mode without side panel');
       }
 
-      const userDataDir = path.join(process.env.HOME || '/tmp', '.gstack', 'chromium-profile');
+      // Must match launch()/launchHeaded(), which both resolve the profile via
+      // resolveChromiumProfile(). Hardcoding $HOME/.gstack/chromium-profile here
+      // silently ignored CHROMIUM_PROFILE, so gbrowser's per-workspace profile
+      // override was dropped the moment a session handed off headless → headed.
+      const userDataDir = resolveChromiumProfile();
       fs.mkdirSync(userDataDir, { recursive: true });
 
       // T1: same automation-tell-stripping defaults as launchHeaded().
