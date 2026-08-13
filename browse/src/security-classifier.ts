@@ -21,8 +21,9 @@
  *
  * Both classifiers degrade gracefully — if the model fails to load, the layer
  * reports status 'degraded' and returns verdict 'safe' (fail-open). The sidebar
- * stays functional; only the extra ML defense disappears. The shield icon
- * reflects this via getStatus() in security.ts.
+ * stays functional; only the extra ML defense disappears. This degradation is
+ * not surfaced in the UI: the sidebar has no security indicator since the
+ * terminal-first rewrite, and /health no longer reports a security status.
  */
 
 import { spawn } from 'child_process';

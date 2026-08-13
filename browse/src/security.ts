@@ -15,8 +15,13 @@
  *   L5:    Canary (this module — inject + check)
  *   L6:    Threshold aggregation (this module — combineVerdict)
  *
- * Cross-process state lives at ~/.gstack/security/session-state.json
- * (per eng review finding 1.2 — server.ts and sidebar-agent.ts are different processes).
+ * There is no longer any cross-process session state.
+ * ~/.gstack/security/session-state.json existed to carry classifier status
+ * across the server.ts / sidebar-agent.ts boundary (eng review finding 1.2);
+ * sidebar-agent.ts went away with the PTY terminal rewrite (ed1e4be2),
+ * leaving nothing to write the file and a /health status that reported
+ * stale or empty data. Both were removed. Per-tab decision files under
+ * ~/.gstack/security/decisions/ are unaffected.
  */
 
 import { randomBytes, createHash } from 'crypto';
@@ -71,18 +76,6 @@ export interface SecurityResult {
   reason?: string;
   signals: LayerSignal[];
   confidence: number;
-}
-
-export type SecurityStatus = 'protected' | 'degraded' | 'inactive';
-
-export interface StatusDetail {
-  status: SecurityStatus;
-  layers: {
-    testsavant: 'ok' | 'degraded' | 'off';
-    transcript: 'ok' | 'degraded' | 'off';
-    canary: 'ok' | 'off';
-  };
-  lastUpdated: string;
 }
 
 // ─── Verdict combiner (ensemble rule, label-first for transcript) ────
@@ -526,45 +519,6 @@ export function logAttempt(record: AttemptRecord): boolean {
   }
 }
 
-// ─── Cross-process session state ─────────────────────────────
-
-const STATE_FILE = path.join(SECURITY_DIR, 'session-state.json');
-
-export interface SessionState {
-  sessionId: string;
-  canary: string;
-  warnedDomains: string[]; // per-session rate limit for special telemetry
-  classifierStatus: {
-    testsavant: 'ok' | 'degraded' | 'off';
-    transcript: 'ok' | 'degraded' | 'off';
-  };
-  lastUpdated: string;
-}
-
-/**
- * Atomic write of session state (temp + rename pattern). Writes are safe
- * across the server.ts / sidebar-agent.ts process boundary.
- */
-export function writeSessionState(state: SessionState): void {
-  try {
-    mkdirSecure(SECURITY_DIR);
-    const tmp = `${STATE_FILE}.tmp.${process.pid}`;
-    writeSecureFile(tmp, JSON.stringify(state, null, 2));
-    fs.renameSync(tmp, STATE_FILE);
-  } catch (err) {
-    console.error('[security] writeSessionState failed:', (err as Error).message);
-  }
-}
-
-export function readSessionState(): SessionState | null {
-  try {
-    if (!fs.existsSync(STATE_FILE)) return null;
-    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
 // ─── User-in-the-loop review on BLOCK ────────────────────────
 //
 // When a tool-output BLOCK fires, the user gets to see the suspected text
@@ -633,32 +587,6 @@ export function excerptForReview(text: string, max = 500): string {
     .trim();
   if (cleaned.length <= max) return cleaned;
   return cleaned.slice(0, max) + '…';
-}
-
-// ─── Status reporting (for shield icon via /health) ──────────
-
-export function getStatus(): StatusDetail {
-  const state = readSessionState();
-  const layers = state?.classifierStatus ?? {
-    testsavant: 'off',
-    transcript: 'off',
-  };
-  const canary = state?.canary ? 'ok' : 'off';
-
-  let status: SecurityStatus;
-  if (layers.testsavant === 'ok' && layers.transcript === 'ok' && canary === 'ok') {
-    status = 'protected';
-  } else if (layers.testsavant === 'off' && canary === 'off') {
-    status = 'inactive';
-  } else {
-    status = 'degraded';
-  }
-
-  return {
-    status,
-    layers: { ...layers, canary: canary as 'ok' | 'off' },
-    lastUpdated: state?.lastUpdated ?? new Date().toISOString(),
-  };
 }
 
 /**

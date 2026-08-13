@@ -1310,9 +1310,6 @@ async function tryConnect() {
           `token: yes (from /health)\nStarting SSE + activity feed...`
         );
         updateConnection(`http://127.0.0.1:${port}`, data.token);
-        // The SEC shield used to drive off /health.security via the chat
-        // path's classifier; with the chat path ripped, the indicator is
-        // not driven yet. Leaving the shield element hidden by default.
         return;
       }
       setLoadingStatus(
