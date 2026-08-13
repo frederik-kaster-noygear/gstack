@@ -169,7 +169,9 @@ export function resolveGstackHome(): string {
  * Resolve the Chromium profile directory.
  *
  * Resolution order:
- *   1. `explicit` arg (passed via ServerConfig.chromiumProfile by embedders)
+ *   1. `explicit` arg — supported, but NO caller currently threads one in.
+ *      `ServerConfig.chromiumProfile` is declared and never read, so in
+ *      practice every call resolves via 2 or 3 below.
  *   2. CHROMIUM_PROFILE env (used by gbrowser's gbd per-workspace)
  *   3. <resolveGstackHome()>/chromium-profile (default)
  */
@@ -193,10 +195,25 @@ export function resolveChromiumProfile(explicit?: string): string {
  *
  * Prevents accidentally deleting lock files from an unrelated directory if
  * profile resolution is misconfigured upstream (CWD drift, env injection).
+ * Note what that guard does NOT do: it checks the SHAPE of the path, not
+ * whether a browser is live in it. The real `~/.gstack/chromium-profile`
+ * satisfies it, so the guard protects unrelated directories, never the
+ * profile actually in use.
  *
- * Caller MUST ensure external coordination has already guaranteed no live
- * peer is using this profile (gbd.lock for gbrowser; single-instance CLI
- * check for gstack).
+ * Caller MUST ensure no live peer is using this profile. Deleting the locks
+ * out from under a running Chromium removes the ProcessSingleton protection
+ * that makes a second instance abort ("Aborting now to avoid profile
+ * corruption") and instead lets two browsers write one user-data-dir.
+ *
+ * gstack's CLI single-instance lock does NOT establish that precondition: it
+ * is per-project (`<projectDir>/.gstack/browse.json.lock`) while the profile
+ * is machine-global, so two daemons in two projects share one profile with no
+ * coordination between them. The enforceable precondition is OWNERSHIP —
+ * only the process that launched the browser may delete its locks. Shutdown
+ * paths therefore go through `BrowserManager.cleanOwnedSingletonLocks()`,
+ * which no-ops unless this process took the profile. Call this function
+ * directly only immediately before launching into the profile yourself
+ * (gbrowser additionally holds gbd.lock).
  */
 export function cleanSingletonLocks(userDataDir: string): void {
   if (!path.isAbsolute(userDataDir)) {
