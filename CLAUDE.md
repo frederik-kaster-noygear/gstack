@@ -386,6 +386,35 @@ Three sites migrated: cdp-bridge frame events, write-commands archive capture,
 cdp-inspector. The helpers prevent the per-session leak class where successful-path
 detach happened but error-path detach was missed.
 
+**Never capture subprocess output through a pipe.** Reading a child's stdout or
+stderr from an async `Bun.spawn` is lossy: under a loaded parent, the FIRST piped
+spawn in the process intermittently yields an empty stream even though the child
+wrote it and exited 0. Measured by instrumenting a full `bun test browse/test/`
+run, reproduced 4 of 4 times, always on the first piped spawn. The bytes are lost
+inside Bun's async pipe plumbing, so neither attaching readers before awaiting
+`proc.exited` nor a manual `getReader()` drain loop avoids it — both were
+measured losing the same bytes. The failures look like success: `$B skill test`
+reporting only bun's banner, a Keychain password read back as `""` and then
+derived into a wrong AES key, `design extract-language` silently skipping its
+DESIGN.md write. Note that `Bun.spawn(cmd)` with no stdio options at all still
+defaults stdout to a pipe, so the read site is where this is visible, not the
+spawn options — both `design/src/cli.ts` bugs had exactly that shape and a grep
+for `stdout: 'pipe'` walked straight past them. Use instead:
+
+- `runCaptured()` from `browse/src/subprocess-capture.ts` — points the child's
+  fds at temp files, so the kernel has flushed everything by the time it exits.
+  Supports `stdin`, `cwd`, `env`, `timeoutMs` (SIGTERM then SIGKILL after a grace
+  period — without escalation `timeoutMs` bounds nothing), and `maxBytes`
+  (per-stream, never splits a multi-byte character). Returns `stdoutTruncated` /
+  `stderrTruncated` separately: a truncated stdout means the result is unusable,
+  a truncated stderr is just noise. Async, so use it when blocking is not
+  acceptable — a child that can hang on a user dialog, or one that calls back
+  into this same daemon.
+- `Bun.spawnSync` — also captures reliably and is simpler. Right for a fast
+  startup probe (`git rev-parse`, `chrome --version`) where blocking is fine.
+- `stdio: 'ignore'` — for a long-lived child nobody reads. An undrained pipe on
+  a chatty child is a stall risk on top of everything else.
+
 **Setup symlink hardening** (v1.38.0.0+). Every link site in `setup` MUST route
 through the `_link_or_copy SRC DST` helper near the `IS_WINDOWS` detection. On
 Windows without Developer Mode, plain `ln -snf` produces frozen file copies that
