@@ -68,6 +68,29 @@ function parseArgs(argv: string[]): {
   return { command, flags, positionals };
 }
 
+/**
+ * Detect the git repository root, or "" if not in a repo / git unavailable.
+ *
+ * Deliberately Bun.spawnSync, not an async Bun.spawn read through
+ * `new Response(proc.stdout)`. Capturing a child through a pipe intermittently
+ * drops a whole stream under a loaded parent (see browse/src/subprocess-capture
+ * for the measurement), and here an empty read is indistinguishable from
+ * "not in a repo": `extract-language` would skip its DESIGN.md write and still
+ * exit 0. This runs once per command, before any real work, so blocking for a
+ * few milliseconds costs nothing.
+ */
+function gitRoot(): string {
+  try {
+    const proc = Bun.spawnSync(["git", "rev-parse", "--show-toplevel"], {
+      timeout: 2_000, // Don't hang if .git is broken
+    });
+    if (proc.exitCode !== 0) return "";
+    return proc.stdout.toString().trim();
+  } catch {
+    return "";
+  }
+}
+
 function printUsage(): void {
   console.log("gstack design — AI-powered UI mockup generation\n");
   console.log("Commands:");
@@ -183,8 +206,7 @@ async function main(): Promise<void> {
         process.exit(1);
       }
       console.error(`Generating implementation prompt from ${promptImage}...`);
-      const proc2 = Bun.spawn(["git", "rev-parse", "--show-toplevel"]);
-      const root = (await new Response(proc2.stdout).text()).trim();
+      const root = gitRoot();
       const d2c = await generateDesignToCodePrompt(promptImage, root || undefined);
       console.log(JSON.stringify(d2c, null, 2));
       break;
@@ -224,8 +246,7 @@ async function main(): Promise<void> {
       }
       console.error(`Extracting design language from ${imagePath}...`);
       const extracted = await extractDesignLanguage(imagePath);
-      const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"]);
-      const repoRoot = (await new Response(proc.stdout).text()).trim();
+      const repoRoot = gitRoot();
       if (repoRoot) {
         updateDesignMd(repoRoot, extracted, imagePath);
       }
