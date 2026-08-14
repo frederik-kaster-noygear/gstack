@@ -13,7 +13,7 @@
  * Remaining bytes = actual cookie value
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, beforeEach, afterAll } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -142,59 +142,40 @@ function createLinuxFixtureDb() {
 // We need to mock:
 // 1. The Keychain access (getKeychainPassword) to return TEST_PASSWORD
 // 2. The cookie DB path resolution to use our fixture DB
+//
+// The keychain tools are stubbed as real executables on PATH rather than by
+// monkey-patching Bun.spawn. An earlier version replaced Bun.spawn with a fake
+// returning ReadableStream stdout, which pinned the module to reading its
+// children through pipes — the one transport that silently loses output (see
+// browse/src/subprocess-capture). A mock shaped like the bug can't fail when
+// the bug is present, and it breaks when the bug is fixed. Stub binaries assert
+// the same behaviour without knowing how the output is captured.
 
 // We'll import the module after setting up the mocks
 let findInstalledBrowsers: any;
 let listDomains: any;
 let importCookies: any;
 let CookieImportError: any;
-let originalSpawn: typeof Bun.spawn;
+let stubBinDir: string;
+
+/** Write an executable POSIX shell stub that prints `output` and exits 0. */
+function writeStubBin(dir: string, name: string, output: string): void {
+  const p = path.join(dir, name);
+  fs.writeFileSync(p, `#!/bin/sh\nprintf '%s\\n' '${output}'\n`, { mode: 0o755 });
+}
 
 beforeAll(async () => {
   createMacFixtureDb();
   createLinuxFixtureDb();
 
-  // Mock Bun.spawn to return test password for keychain access
-  originalSpawn = Bun.spawn;
-  // @ts-ignore - monkey-patching for test
-  Bun.spawn = function(cmd: any, opts: any) {
-    // Intercept security find-generic-password calls
-    if (Array.isArray(cmd) && cmd[0] === 'security' && cmd[1] === 'find-generic-password') {
-      // Return test password for any known test service
-      return {
-        stdout: new ReadableStream({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode(TEST_PASSWORD + '\n'));
-            controller.close();
-          }
-        }),
-        stderr: new ReadableStream({
-          start(controller) { controller.close(); }
-        }),
-        exited: Promise.resolve(0),
-        kill: () => {},
-      };
-    }
-    if (Array.isArray(cmd) && cmd[0] === 'secret-tool' && cmd[1] === 'lookup') {
-      return {
-        stdout: new ReadableStream({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode(LINUX_V11_PASSWORD + '\n'));
-            controller.close();
-          }
-        }),
-        stderr: new ReadableStream({
-          start(controller) { controller.close(); }
-        }),
-        exited: Promise.resolve(0),
-        kill: () => {},
-      };
-    }
-    // Pass through other spawn calls
-    return originalSpawn(cmd, opts);
-  };
+  // Stub the keychain tools as real executables, found ahead of any real ones
+  // on PATH. `security` takes the macOS branch, `secret-tool` the Linux v11
+  // branch; each prints its password and exits 0, like the real tool on a hit.
+  stubBinDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-keychain-stub-'));
+  writeStubBin(stubBinDir, 'security', TEST_PASSWORD);
+  writeStubBin(stubBinDir, 'secret-tool', LINUX_V11_PASSWORD);
 
-  // Import the module (uses our mocked Bun.spawn)
+  // Import the module (its subprocesses now resolve to the stubs)
   const mod = await import('../src/cookie-import-browser');
   findInstalledBrowsers = mod.findInstalledBrowsers;
   listDomains = mod.listDomains;
@@ -202,10 +183,17 @@ beforeAll(async () => {
   CookieImportError = mod.CookieImportError;
 });
 
+// Per-test, not once in beforeAll: the global preload (test-setup.ts, wired via
+// `[test] preload` in bunfig.toml) restores PATH after every test to stop env
+// pollution leaking between files, which would otherwise strip the stub dir
+// after the first test in this file.
+beforeEach(() => {
+  process.env.PATH = `${stubBinDir}${path.delimiter}${process.env.PATH ?? ''}`;
+});
+
 afterAll(() => {
-  // Restore Bun.spawn
-  // @ts-ignore - monkey-patching for test
-  Bun.spawn = originalSpawn;
+  // PATH itself is restored by the global preload after every test.
+  try { fs.rmSync(stubBinDir, { recursive: true, force: true }); } catch {}
   // Clean up fixture DB
   try { fs.unlinkSync(FIXTURE_DB); } catch {}
   try { fs.unlinkSync(LINUX_FIXTURE_DB); } catch {}

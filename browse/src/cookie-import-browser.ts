@@ -41,6 +41,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { TEMP_DIR } from './platform';
+import { runCaptured } from './subprocess-capture';
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -525,31 +526,32 @@ async function dpapiDecrypt(encryptedBytes: Buffer): Promise<Buffer> {
     'Write-Output ([System.Convert]::ToBase64String($dec))',
   ].join('; ');
 
-  const proc = Bun.spawn(['powershell', '-NoProfile', '-Command', script], {
-    windowsHide: true,
-    stdin: 'pipe',
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-
-  proc.stdin.write(encryptedBytes.toString('base64'));
-  proc.stdin.end();
-
-  const timeout = new Promise<never>((_, reject) =>
-    setTimeout(() => {
-      proc.kill();
-      reject(new CookieImportError('DPAPI decryption timed out', 'keychain_timeout', 'retry'));
-    }, 10_000),
-  );
-
   try {
-    const exitCode = await Promise.race([proc.exited, timeout]);
-    const stdout = await new Response(proc.stdout).text();
+    const { stdout, stderr, exitCode, timedOut } = await runCaptured(
+      ['powershell', '-NoProfile', '-Command', script],
+      { stdin: encryptedBytes.toString('base64'), timeoutMs: 10_000 },
+    );
+
+    if (timedOut) {
+      throw new CookieImportError('DPAPI decryption timed out', 'keychain_timeout', 'retry');
+    }
     if (exitCode !== 0) {
-      const stderr = await new Response(proc.stderr).text();
       throw new CookieImportError(`DPAPI decryption failed: ${stderr.trim()}`, 'keychain_error');
     }
-    return Buffer.from(stdout.trim(), 'base64');
+
+    const key = Buffer.from(stdout.trim(), 'base64');
+    // PowerShell exiting 0 having printed nothing means we did not read the key,
+    // not that the key is empty. Returning the empty buffer would surface later
+    // as an opaque "Invalid key length" from createDecipheriv, or worse get
+    // cached and mis-decrypt every cookie. Fail here, where the cause is known.
+    if (key.length === 0) {
+      throw new CookieImportError(
+        'DPAPI decryption returned no key despite exiting cleanly — the output was not captured.',
+        'keychain_error',
+        'retry',
+      );
+    }
+    return key;
   } catch (err) {
     if (err instanceof CookieImportError) throw err;
     throw new CookieImportError(
@@ -560,28 +562,21 @@ async function dpapiDecrypt(encryptedBytes: Buffer): Promise<Buffer> {
 }
 
 async function getMacKeychainPassword(service: string): Promise<string> {
-  // Use async Bun.spawn with timeout to avoid blocking the event loop.
-  // macOS may show an Allow/Deny dialog that blocks until the user responds.
-  const proc = Bun.spawn(
-    ['security', 'find-generic-password', '-s', service, '-w'],
-    { stdout: 'pipe', stderr: 'pipe' },
-  );
+  // Captured async rather than via Bun.spawnSync, which would block the event
+  // loop: macOS may show an Allow/Deny dialog that hangs until the user answers.
+  try {
+    const { stdout, stderr, exitCode, timedOut } = await runCaptured(
+      ['security', 'find-generic-password', '-s', service, '-w'],
+      { timeoutMs: 10_000 },
+    );
 
-  const timeout = new Promise<never>((_, reject) =>
-    setTimeout(() => {
-      proc.kill();
-      reject(new CookieImportError(
+    if (timedOut) {
+      throw new CookieImportError(
         `macOS is waiting for Keychain permission. Look for a dialog asking to allow access to "${service}".`,
         'keychain_timeout',
         'retry',
-      ));
-    }, 10_000),
-  );
-
-  try {
-    const exitCode = await Promise.race([proc.exited, timeout]);
-    const stdout = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
+      );
+    }
 
     if (exitCode !== 0) {
       // Distinguish denied vs not found vs other
@@ -606,7 +601,19 @@ async function getMacKeychainPassword(service: string): Promise<string> {
       );
     }
 
-    return stdout.trim();
+    // Test the RAW capture, not the trimmed value: a password that is entirely
+    // whitespace is a real (if odd) password, whereas nothing at all means we
+    // never read the output. `security -w` exiting 0 always prints something,
+    // so an empty capture is a lost read. Deriving a key from "" would succeed,
+    // get cached, and silently mis-decrypt every cookie in the profile.
+    if (stdout.length === 0) {
+      throw new CookieImportError(
+        `Keychain returned no password for "${service}" despite succeeding — the output was not captured.`,
+        'keychain_error',
+        'retry',
+      );
+    }
+    return password;
   } catch (err) {
     if (err instanceof CookieImportError) throw err;
     throw new CookieImportError(
@@ -638,17 +645,10 @@ async function getLinuxSecretPassword(browser: BrowserInfo): Promise<string | nu
 }
 
 async function runPasswordLookup(cmd: string[], timeoutMs: number): Promise<string | null> {
+  // Captured async rather than via Bun.spawnSync, which would block the event
+  // loop: secret-tool can hang on a keyring-unlock prompt.
   try {
-    const proc = Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe' });
-    const timeout = new Promise<never>((_, reject) =>
-      setTimeout(() => {
-        proc.kill();
-        reject(new Error('timeout'));
-      }, timeoutMs),
-    );
-
-    const exitCode = await Promise.race([proc.exited, timeout]);
-    const stdout = await new Response(proc.stdout).text();
+    const { stdout, exitCode } = await runCaptured(cmd, { timeoutMs });
     if (exitCode !== 0) return null;
 
     const password = stdout.trim();
@@ -775,17 +775,29 @@ function findBrowserExe(browserName: string): string | null {
   return null;
 }
 
-function isBrowserRunning(browserName: string): Promise<boolean> {
+async function isBrowserRunning(browserName: string): Promise<boolean> {
   const exe = browserName.toLowerCase().includes('edge') ? 'msedge.exe' : 'chrome.exe';
-  return new Promise((resolve) => {
-    const proc = Bun.spawn(['tasklist', '/FI', `IMAGENAME eq ${exe}`, '/NH'], {
-      stdout: 'pipe', stderr: 'pipe', windowsHide: true,
-    });
-    proc.exited.then(async () => {
-      const out = await new Response(proc.stdout).text();
-      resolve(out.toLowerCase().includes(exe));
-    }).catch(() => resolve(false));
-  });
+  try {
+    // Timed so a wedged tasklist can't hang the import indefinitely, and
+    // captured to a file so a lost read can't report a running browser as
+    // closed — which sends us on to CDP against a profile Chrome still locks.
+    const { stdout, timedOut } = await runCaptured(
+      ['tasklist', '/FI', `IMAGENAME eq ${exe}`, '/NH'],
+      { timeoutMs: 5_000 },
+    );
+    // A timeout yields empty stdout, which would read as "not running" and send
+    // us into exactly the profile-lock corruption this check exists to stop. We
+    // don't know, so answer with the side that fails safe: the caller tells the
+    // user to close the browser, which they can act on. Guessing "closed" is
+    // not recoverable.
+    if (timedOut) return true;
+    return stdout.toLowerCase().includes(exe);
+  } catch {
+    // Distinct from a timeout: tasklist could not be run at all, so the check is
+    // unavailable rather than inconclusive. Answering "running" here would block
+    // the import permanently with no way for the user to clear it.
+    return false;
+  }
 }
 
 /**
@@ -870,7 +882,9 @@ export async function importCookiesViaCdp(
     '--disable-extensions',
     '--disable-sync',
     '--no-default-browser-check',
-  ], { stdout: 'pipe', stderr: 'pipe' });
+    // Discarded rather than piped: nothing reads these streams, and headless
+    // Chrome is chatty enough to fill an undrained pipe buffer and stall.
+  ], { stdout: 'ignore', stderr: 'ignore' });
 
   // Wait for Chrome to start, then find a page target's WebSocket URL.
   // Network.getAllCookies is only available on page targets, not browser.
