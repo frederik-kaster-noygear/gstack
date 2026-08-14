@@ -24,6 +24,7 @@ import { profileOwner, ensureProjectProfile, runProfilesCommand } from './chromi
 // safe to pull the shared pairing default into the CLI.
 import { DEFAULT_PAIR_SCOPES } from './token-registry';
 import { chooseSession, extractSession, systemProcLookup } from './session-name';
+import { sweepStaleCaptureDirs } from './subprocess-capture';
 
 const config = resolveConfig();
 const IS_WINDOWS = process.platform === 'win32';
@@ -1892,6 +1893,10 @@ Refs:           After 'snapshot', use @e1, @e2... as selectors:
 
   // One-time cleanup of legacy /tmp state files
   cleanupLegacyState();
+  // Reclaim subprocess-capture dirs orphaned by a killed parent. These can hold
+  // plaintext keychain passwords from a cookie import, and the normal `finally`
+  // cleanup never runs when the daemon is SIGKILLed.
+  sweepStaleCaptureDirs();
 
   const command = args[0];
   const commandArgs = args.slice(1);
