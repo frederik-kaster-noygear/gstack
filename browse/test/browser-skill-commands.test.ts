@@ -379,22 +379,41 @@ describe.skipIf(SKIP_SPAWN)('spawnSkill: lifecycle', () => {
       skill, skillArgs: [], trusted: true, timeoutSeconds: 10, port: 9999,
     });
     expect(result.truncated).toBe(true);
+    expect(result.stdoutTruncated).toBe(true);
     expect(result.stdout.length).toBeLessThanOrEqual(1024 * 1024);
+  }, 10_000);
+
+  it('a chatty stderr does not fail a run whose result is intact', async () => {
+    // stdout carries the result; stderr is progress logging. Gating the run on
+    // a combined truncation flag threw away a perfectly good result whenever a
+    // skill logged more than 1MB of noise, so the gate is stdout-specific.
+    const dir = makeSkillDir(tiers.bundled, 'noisy',
+      'name: noisy\nhost: x.com\ntrusted: true',
+      `const chunk = 'x'.repeat(64 * 1024);
+       for (let i = 0; i < 40; i++) process.stderr.write(chunk);
+       process.stdout.write(JSON.stringify({ ok: true }));`,
+    );
+    const skill = readBrowserSkill('noisy', tiers)!;
+    const result = await spawnSkill({
+      skill, skillArgs: [], trusted: true, timeoutSeconds: 10, port: 9999,
+    });
+    expect(result.stderrTruncated).toBe(true);
+    expect(result.stdoutTruncated).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ ok: true });
   }, 10_000);
 });
 
 describe('subprocess capture goes through temp files, not pipes', () => {
-  // Tripwire. Capturing a child's output through `stdout: 'pipe'` is lossy
-  // here: under a loaded parent, the first piped spawn in the process
-  // intermittently yields an empty stderr even though the child wrote it and
-  // exited 0. Neither draining before awaiting exit nor a manual getReader()
-  // loop avoids it — both were measured losing the same bytes. It flaked
-  // `$B skill test` (a dropped stderr left only bun's banner) and would blank
-  // a skill's JSON result on `$B skill run` while still reporting success.
+  // Module-scoped half of the tripwire. The ban on pipe capture itself is
+  // enforced repo-wide in subprocess-capture.test.ts; what this pins is the
+  // structural invariant specific to this module — that it owns no spawn of
+  // its own, so every present and future subprocess here inherits
+  // runCaptured()'s file-based capture rather than reimplementing it.
   //
-  // runToFiles() points the child's fds at temp files instead, so the kernel
-  // has flushed everything by the time the child exits. This test fails if a
-  // refactor reintroduces pipe capture in this module.
+  // This matters because a dropped read here is silent: `$B skill test` would
+  // report only bun's banner (the pass/fail summary lives on stderr), and
+  // `$B skill run` would blank the skill's JSON result and still exit 0.
   //
   // Comments are stripped first, so the module's own prose — which names the
   // banned pattern in order to explain it — doesn't trip checks meant for code.
@@ -403,21 +422,14 @@ describe('subprocess capture goes through temp files, not pipes', () => {
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^\s*\/\/.*$/gm, '');
 
-  it("does not spawn with stdout/stderr: 'pipe'", () => {
-    expect(src).not.toMatch(/std(out|err):\s*'pipe'/);
+  it('spawns no subprocess directly', () => {
+    expect(src.match(/Bun\.spawn(Sync)?\(/g) ?? []).toHaveLength(0);
   });
 
-  it('does not read child output via Response(proc.stdout/stderr) or getReader', () => {
-    expect(src).not.toMatch(/new Response\(\s*proc\.(stdout|stderr)/);
-    expect(src).not.toMatch(/proc\.(stdout|stderr)[\s\S]{0,40}getReader\(/);
-  });
-
-  it('every spawn site routes through runToFiles', () => {
-    // The structural invariant: runToFiles owns the module's only Bun.spawn,
-    // so any present or future spawn site inherits the file-based capture.
+  it('runs every subprocess through the shared runCaptured helper', () => {
     // Counted rather than name-checked so adding a spawn site that bypasses
     // the helper fails here instead of silently reintroducing the bug.
-    expect(src.match(/Bun\.spawn\(/g) ?? []).toHaveLength(1);
-    expect((src.match(/await runToFiles\(/g) ?? []).length).toBeGreaterThanOrEqual(2);
+    expect(src).toMatch(/import \{ runCaptured \} from '\.\/subprocess-capture'/);
+    expect((src.match(/await runCaptured\(/g) ?? []).length).toBeGreaterThanOrEqual(2);
   });
 });

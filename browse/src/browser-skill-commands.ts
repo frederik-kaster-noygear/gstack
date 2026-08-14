@@ -15,11 +15,11 @@
  * skills (frontmatter `trusted: true`) inherit the full process env.
  *
  * Output protocol: stdout = JSON, stderr = streaming logs, exit code 0/non-0.
- * stdout cap = 1MB (truncate + nonzero exit if exceeded). Default timeout 60s.
+ * Each stream is capped at 1MB independently; a truncated stdout fails the run
+ * (the result is unusable), a truncated stderr does not. Default timeout 60s.
  */
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import {
   listBrowserSkills,
@@ -30,9 +30,10 @@ import {
   type TierPaths,
 } from './browser-skills';
 import { mintSkillToken, revokeSkillToken, generateSpawnId } from './skill-token';
+import { runCaptured } from './subprocess-capture';
 
 const DEFAULT_TIMEOUT_SECONDS = 60;
-const MAX_STDOUT_BYTES = 1024 * 1024; // 1 MB
+const MAX_CAPTURE_BYTES = 1024 * 1024; // 1 MB, applied to stdout and stderr separately
 
 // ─── Public command dispatcher ──────────────────────────────────
 
@@ -159,11 +160,15 @@ async function handleRun(args: string[], ctx: SkillCommandContext): Promise<stri
     port: ctx.port,
   });
 
-  if (result.exitCode !== 0 || result.timedOut || result.truncated) {
-    const summary = result.truncated
-      ? `truncated stdout at ${MAX_STDOUT_BYTES} bytes`
+  // Gate on stdout truncation specifically. stdout carries the skill's result,
+  // so losing its tail makes the run unusable; stderr is progress chatter, and
+  // failing an otherwise-clean run over a noisy log would throw away the result
+  // the caller actually wanted.
+  if (result.exitCode !== 0 || result.timedOut || result.stdoutTruncated) {
+    const summary = result.stdoutTruncated
+      ? `truncated result at ${MAX_CAPTURE_BYTES} bytes`
       : result.timedOut
-        ? `timed out after ${timeoutSeconds}s`
+        ? `timed out after ${timeoutSeconds}s${result.killed ? ' (SIGKILLed)' : ''}`
         : `exit ${result.exitCode}`;
     const err = new Error(`Skill "${name}" failed: ${summary}\n--- stderr ---\n${result.stderr.slice(0, 4096)}`);
     (err as any).exitCode = result.exitCode || 1;
@@ -186,7 +191,7 @@ async function handleTest(args: string[], ctx: SkillCommandContext): Promise<str
     throw new Error(`Skill "${name}" has no script.test.ts at ${testFile}`);
   }
 
-  const { stdout, stderr, exitCode } = await runToFiles(['bun', 'test', testFile], {
+  const { stdout, stderr, exitCode } = await runCaptured(['bun', 'test', testFile], {
     cwd: skill.dir,
     env: process.env,
   });
@@ -206,102 +211,6 @@ async function handleTest(args: string[], ctx: SkillCommandContext): Promise<str
     throw new Error(`Skill "${name}" tests exited 0 but produced no output — the run was not captured.`);
   }
   return report + '\n';
-}
-
-interface RunToFilesOptions {
-  cwd: string;
-  env: Record<string, string> | NodeJS.ProcessEnv;
-  /** Kill the child after this many ms. Omit for no timeout. */
-  timeoutMs?: number;
-  /** Cap the captured stdout. Bytes past the cap are dropped, `truncated` set. */
-  maxStdoutBytes?: number;
-}
-
-interface RunToFilesResult {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-  timedOut: boolean;
-  truncated: boolean;
-}
-
-/**
- * Run a command, capturing stdout/stderr by pointing the child's file
- * descriptors at temp files rather than at pipes.
- *
- * Why not `stdout: 'pipe'`: under a loaded parent, the FIRST piped spawn in a
- * process intermittently yields an empty stderr even though the child wrote it
- * and exited 0. The data is lost inside Bun's async pipe plumbing, so neither
- * draining before awaiting exit nor a manual `getReader()` loop avoids it —
- * both were measured losing the same bytes in the same position. It surfaced in
- * `$B skill test`, where `bun test` splits its report across streams (banner ->
- * stdout, pass/fail summary -> stderr) so a dropped stderr silently degraded
- * the result to just the banner; for `$B skill run` the same loss would blank
- * the skill's JSON result and still look like success.
- *
- * Writing to files takes user-space streams out of the path: the kernel has
- * flushed every byte by the time the child exits, so the post-exit read is
- * always complete. It also removes the pipe-buffer stall risk on chatty
- * children. `Bun.spawnSync` captures reliably too, but blocking the event loop
- * is not an option here — a spawned skill calls back into this same daemon on
- * GSTACK_PORT, so a synchronous wait would deadlock it.
- */
-async function runToFiles(cmd: string[], opts: RunToFilesOptions): Promise<RunToFilesResult> {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-skill-'));
-  const outPath = path.join(dir, 'stdout');
-  const errPath = path.join(dir, 'stderr');
-  try {
-    // Hand Bun the destinations as BunFiles rather than raw fds we opened: Bun
-    // then owns the descriptors for the child's whole lifetime. Opening them
-    // here and closing them after exit instead put us in Bun's fd bookkeeping,
-    // which surfaced as a stray EBADF from epoll_ctl on a later spawn.
-    const proc = Bun.spawn(cmd, {
-      cwd: opts.cwd,
-      env: opts.env as any,
-      stdout: Bun.file(outPath) as any,
-      stderr: Bun.file(errPath) as any,
-    });
-
-    let timedOut = false;
-    const killer = opts.timeoutMs === undefined ? undefined : setTimeout(() => {
-      timedOut = true;
-      try { proc.kill(); } catch {}
-    }, opts.timeoutMs);
-
-    const exitCode = await proc.exited;
-    if (killer !== undefined) clearTimeout(killer);
-
-    // The child's own writes are flushed by the kernel when it exits, so
-    // everything it wrote is readable here.
-    const cap = opts.maxStdoutBytes ?? Infinity;
-    const stdout = readCappedFile(outPath, cap);
-    const stderr = readCappedFile(errPath, cap);
-    return {
-      stdout: stdout.text,
-      stderr: stderr.text,
-      exitCode: timedOut ? 124 : exitCode,
-      timedOut,
-      truncated: stdout.truncated,
-    };
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-interface CappedRead { text: string; truncated: boolean; }
-
-/** Read at most `capBytes` from a file, reporting whether anything was dropped. */
-function readCappedFile(p: string, capBytes: number): CappedRead {
-  const size = fs.statSync(p).size;
-  if (size <= capBytes) return { text: fs.readFileSync(p, 'utf-8'), truncated: false };
-  const fd = fs.openSync(p, 'r');
-  try {
-    const buf = Buffer.alloc(capBytes);
-    const read = fs.readSync(fd, buf, 0, capBytes, 0);
-    return { text: buf.subarray(0, read).toString('utf-8'), truncated: true };
-  } finally {
-    try { fs.closeSync(fd); } catch {}
-  }
 }
 
 // ─── rm ─────────────────────────────────────────────────────────
@@ -345,7 +254,7 @@ export interface SpawnSkillResult {
  * 2. Build the env: trusted=true → process.env; trusted=false → scrubbed.
  *    GSTACK_PORT and GSTACK_SKILL_TOKEN are always set.
  * 3. Spawn `bun run script.ts -- <args>` with cwd=skill.dir.
- * 4. Capture stdout (capped at 1MB) and stderr; enforce timeout.
+ * 4. Capture stdout and stderr (each capped at 1MB); enforce timeout.
  * 5. On exit/timeout, revoke the token. Always.
  */
 export async function spawnSkill(opts: SpawnSkillOptions): Promise<SpawnSkillResult> {
@@ -367,13 +276,14 @@ export async function spawnSkill(opts: SpawnSkillOptions): Promise<SpawnSkillRes
       throw new Error(`Skill "${opts.skill.name}" missing script.ts at ${scriptPath}`);
     }
 
-    // Captured via temp files, not pipes — see runToFiles for why. A dropped
-    // read here would blank the skill's JSON result and still report success.
-    return await runToFiles(['bun', 'run', scriptPath, '--', ...opts.skillArgs], {
+    // Captured via temp files, not pipes — see subprocess-capture for why. A
+    // dropped read here would blank the skill's JSON result and still report
+    // success.
+    return await runCaptured(['bun', 'run', scriptPath, '--', ...opts.skillArgs], {
       cwd: opts.skill.dir,
       env,
       timeoutMs: opts.timeoutSeconds * 1000,
-      maxStdoutBytes: MAX_STDOUT_BYTES,
+      maxBytes: MAX_CAPTURE_BYTES,
     });
   } finally {
     revokeSkillToken(opts.skill.name, spawnId);
