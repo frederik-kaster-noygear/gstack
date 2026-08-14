@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
+import { runCaptured } from '../src/subprocess-capture';
 
 /**
  * Guard the core refactor invariant: importing browse/src/server.ts must NOT
@@ -66,7 +67,11 @@ console.log(JSON.stringify({
 process.exit(0);
 `;
 
-    const proc = Bun.spawn(['bun', '-e', childScript], {
+    // Captured via temp files rather than pipes: a piped read intermittently
+    // loses a whole stream under a loaded parent, which here would drop the
+    // snapshot line and fail this test for a reason that has nothing to do
+    // with import side effects. See browse/src/subprocess-capture.
+    const { stdout, stderr } = await runCaptured(['bun', '-e', childScript], {
       env: {
         ...process.env,
         HOME: tmpHome,
@@ -77,13 +82,7 @@ process.exit(0);
         // happens) won't crawl the host's real .gstack/.
         BROWSE_STATE_FILE: path.join(tmpGstack, 'browse.json'),
       },
-      stdout: 'pipe',
-      stderr: 'pipe',
     });
-
-    const stdout = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
-    await proc.exited;
 
     // The last JSON line in stdout is our snapshot.
     const jsonLine = stdout.trim().split('\n').filter(l => l.startsWith('{')).pop();
