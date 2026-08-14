@@ -41,6 +41,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { isIP } from 'node:net';
+import { runCaptured } from './subprocess-capture';
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -598,22 +599,35 @@ async function dpapiDecrypt(encryptedBytes: Buffer): Promise<Buffer> {
     'Write-Output ([System.Convert]::ToBase64String($dec))',
   ].join('; ');
 
-  const proc = Bun.spawn(['powershell', '-NoProfile', '-Command', script], {
-    windowsHide: true,
-    stdin: 'pipe',
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-
   try {
-    proc.stdin.write(encryptedBytes.toString('base64'));
-    proc.stdin.end();
-    const { exitCode, stdout } = await readCredentialProcess(proc, 10_000, () =>
-      new CookieImportError('DPAPI decryption timed out', 'keychain_timeout', 'retry'));
+    // 64 KiB cap per stream (upstream v1.88.1.0 credential-output limit);
+    // runCaptured, not a pipe, per the fork's no-pipe-capture invariant.
+    const { stdout, exitCode, timedOut, truncated } = await runCaptured(
+      ['powershell', '-NoProfile', '-Command', script],
+      { stdin: encryptedBytes.toString('base64'), timeoutMs: 10_000, maxBytes: 64 * 1024 },
+    );
+
+    if (timedOut) {
+      throw new CookieImportError('DPAPI decryption timed out', 'keychain_timeout', 'retry');
+    }
+    if (truncated) throw new Error('Credential process output exceeded the limit');
     if (exitCode !== 0) {
       throw new CookieImportError('DPAPI decryption failed', 'keychain_error');
     }
-    return Buffer.from(stdout.trim(), 'base64');
+
+    const key = Buffer.from(stdout.trim(), 'base64');
+    // PowerShell exiting 0 having printed nothing means we did not read the key,
+    // not that the key is empty. Returning the empty buffer would surface later
+    // as an opaque "Invalid key length" from createDecipheriv, or worse get
+    // cached and mis-decrypt every cookie. Fail here, where the cause is known.
+    if (key.length === 0) {
+      throw new CookieImportError(
+        'DPAPI decryption returned no key despite exiting cleanly — the output was not captured.',
+        'keychain_error',
+        'retry',
+      );
+    }
+    return key;
   } catch (err) {
     if (err instanceof CookieImportError) throw err;
     throw new CookieImportError(
@@ -623,58 +637,23 @@ async function dpapiDecrypt(encryptedBytes: Buffer): Promise<Buffer> {
   }
 }
 
-async function readCredentialProcess(
-  proc: { exited: Promise<number>; stdout: ReadableStream<Uint8Array>; stderr: ReadableStream<Uint8Array>; kill(): void },
-  timeoutMs: number,
-  timeoutError: () => Error,
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const readers = [proc.stdout.getReader(), proc.stderr.getReader()];
-  const read = async (reader: ReadableStreamDefaultReader<Uint8Array>): Promise<string> => {
-    const chunks: Uint8Array[] = [];
-    let bytes = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return Buffer.concat(chunks, bytes).toString('utf8');
-      bytes += value.byteLength;
-      if (bytes > 64 * 1024) throw new Error('Credential process output exceeded the limit');
-      chunks.push(value);
-    }
-  };
-  let timer: ReturnType<typeof setTimeout>;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(timeoutError()), timeoutMs);
-  });
-  try {
-    const [exitCode, stdout, stderr] = await Promise.race([
-      Promise.all([proc.exited, read(readers[0]), read(readers[1])]), timeout,
-    ]);
-    return { exitCode, stdout, stderr };
-  } catch (error) {
-    try { proc.kill(); } catch {}
-    for (const reader of readers) {
-      try { void reader.cancel().catch(() => {}); } catch {}
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer!);
-  }
-}
-
 async function getMacKeychainPassword(service: string): Promise<string> {
-  // Use async Bun.spawn with timeout to avoid blocking the event loop.
-  // macOS may show an Allow/Deny dialog that blocks until the user responds.
-  const proc = Bun.spawn(
-    ['security', 'find-generic-password', '-s', service, '-w'],
-    { stdout: 'pipe', stderr: 'pipe', windowsHide: true },
-  );
-
+  // Captured async rather than via Bun.spawnSync, which would block the event
+  // loop: macOS may show an Allow/Deny dialog that hangs until the user answers.
   try {
-    const { exitCode, stdout, stderr } = await readCredentialProcess(proc, 10_000, () =>
-      new CookieImportError(
+    const { stdout, stderr, exitCode, timedOut, truncated } = await runCaptured(
+      ['security', 'find-generic-password', '-s', service, '-w'],
+      { timeoutMs: 10_000, maxBytes: 64 * 1024 },
+    );
+    if (truncated) throw new Error('Credential process output exceeded the limit');
+
+    if (timedOut) {
+      throw new CookieImportError(
         `macOS is waiting for Keychain permission. Look for a dialog asking to allow access to "${service}".`,
         'keychain_timeout',
         'retry',
-      ));
+      );
+    }
 
     if (exitCode !== 0) {
       // Distinguish denied vs not found vs other
@@ -699,6 +678,18 @@ async function getMacKeychainPassword(service: string): Promise<string> {
       );
     }
 
+    // Test the RAW capture, not the trimmed value: a password that is entirely
+    // whitespace is a real (if odd) password, whereas nothing at all means we
+    // never read the output. `security -w` exiting 0 always prints something,
+    // so an empty capture is a lost read. Deriving a key from "" would succeed,
+    // get cached, and silently mis-decrypt every cookie in the profile.
+    if (stdout.length === 0) {
+      throw new CookieImportError(
+        `Keychain returned no password for "${service}" despite succeeding — the output was not captured.`,
+        'keychain_error',
+        'retry',
+      );
+    }
     return stdout.trim();
   } catch (err) {
     if (err instanceof CookieImportError) throw err;
@@ -731,9 +722,11 @@ async function getLinuxSecretPassword(browser: BrowserInfo): Promise<string | nu
 }
 
 async function runPasswordLookup(cmd: string[], timeoutMs: number): Promise<string | null> {
+  // Captured async rather than via Bun.spawnSync, which would block the event
+  // loop: secret-tool can hang on a keyring-unlock prompt.
   try {
-    const proc = Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe', windowsHide: true });
-    const { exitCode, stdout } = await readCredentialProcess(proc, timeoutMs, () => new Error('timeout'));
+    const { stdout, exitCode, truncated } = await runCaptured(cmd, { timeoutMs, maxBytes: 64 * 1024 });
+    if (truncated) return null;
     if (exitCode !== 0) return null;
 
     const password = stdout.trim();
