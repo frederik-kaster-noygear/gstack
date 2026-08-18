@@ -529,7 +529,7 @@ async function dpapiDecrypt(encryptedBytes: Buffer): Promise<Buffer> {
   try {
     const { stdout, stderr, exitCode, timedOut } = await runCaptured(
       ['powershell', '-NoProfile', '-Command', script],
-      { stdin: encryptedBytes.toString('base64'), timeoutMs: 10_000 },
+      { stdin: encryptedBytes.toString('base64'), timeoutMs: 10_000, windowsHide: true },
     );
 
     if (timedOut) {
@@ -783,7 +783,7 @@ async function isBrowserRunning(browserName: string): Promise<boolean> {
     // closed — which sends us on to CDP against a profile Chrome still locks.
     const { stdout, timedOut } = await runCaptured(
       ['tasklist', '/FI', `IMAGENAME eq ${exe}`, '/NH'],
-      { timeoutMs: 5_000 },
+      { timeoutMs: 5_000, windowsHide: true },
     );
     // A timeout yields empty stdout, which would read as "not running" and send
     // us into exactly the profile-lock corruption this check exists to stop. We

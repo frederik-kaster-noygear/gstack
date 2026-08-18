@@ -85,6 +85,13 @@ export interface RunCapturedOptions {
    * than decoded into a replacement character.
    */
   maxBytes?: number;
+  /**
+   * Hide the child's console window on Windows (#1835). Callers that shell out
+   * to a Windows-only probe (powershell, tasklist) must set this: without it
+   * every DPAPI decrypt or process check flashes a console window at the user.
+   * Inert on POSIX.
+   */
+  windowsHide?: boolean;
 }
 
 export interface RunCapturedResult {
@@ -197,7 +204,8 @@ export async function runCaptured(
       stdin: stdinSource as any,
       stdout: Bun.file(outPath) as any,
       stderr: Bun.file(errPath) as any,
-    });
+      windowsHide: opts.windowsHide ?? false,
+    } as any);
 
     let timedOut = false;
     let killed = false;
