@@ -316,8 +316,14 @@ describe("escape valve", () => {
 });
 
 describe("path-ignore for generated data files (#1946 follow-up)", () => {
-  // A blob larger than the engine's 1 MiB scan cap. Without an ignore rule this
-  // trips a false-positive HIGH engine.input_too_large and blocks the push.
+  // A blob larger than the engine's 1 MiB scan cap.
+  //
+  // This no longer oversize-blocks on its own: scanAddedLines() slices added
+  // lines into sub-cap chunks and unions the findings, so a large but
+  // secret-free file is genuinely SCANNED and passes. Ignore rules are
+  // therefore about not paying to scan generated data, not about dodging a
+  // false-positive engine.input_too_large. Fail-closed is unchanged where it
+  // counts: a secret in a non-ignored file still blocks at any size (b, c).
   const BIG = "x,y\n".repeat(400_000); // ~1.5 MiB
 
   function writeIgnoreFile(globs: string): void {
@@ -340,18 +346,21 @@ describe("path-ignore for generated data files (#1946 follow-up)", () => {
     expect(stderr).toContain(".gstack/redact-prepush-ignore");
   });
 
-  test("(b) a non-ignored large file still blocks fail-closed", () => {
+  test("(b) a secret in a non-ignored OVERSIZED file still blocks fail-closed", () => {
     writeIgnoreFile("prospecting/exports/**/*.csv\n");
     const base = git(["rev-parse", "HEAD"]);
-    // Matches no ignore glob → must still oversize-block.
-    fs.writeFileSync(path.join(repo, "bigdata.txt"), BIG);
+    // Matches no ignore glob, and is past the engine's single-scan cap. Slicing
+    // must not lose the credential: the size is exactly what used to hide it
+    // behind an engine.input_too_large that named no secret.
+    fs.writeFileSync(path.join(repo, "bigdata.txt"), BIG + "key AKIA1234567890ABCDEF\n" + BIG);
     git(["add", "-A"]);
-    git(["commit", "-q", "-m", "big non-ignored file"]);
+    git(["commit", "-q", "-m", "big non-ignored file with a secret"]);
     const head = git(["rev-parse", "HEAD"]);
     const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
     expect(code).toBe(1);
     expect(stderr).toContain("BLOCKED");
-    expect(stderr).toContain("engine.input_too_large");
+    expect(stderr).toContain("aws.access_key");
+    expect(stderr).not.toContain("skipped");
   });
 
   test("(c) a real secret in a non-ignored file still blocks even with ignore rules present", () => {
@@ -408,16 +417,19 @@ describe("path-ignore for generated data files (#1946 follow-up)", () => {
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  test("(f) no ignore rules → default behavior unchanged (large file blocks)", () => {
+  test("(f) no ignore rules → nothing is exempted and the large file is scanned", () => {
     const base = git(["rev-parse", "HEAD"]);
     fs.writeFileSync(path.join(repo, "export.csv"), BIG);
     git(["add", "-A"]);
     git(["commit", "-q", "-m", "big csv, no ignore rules"]);
     const head = git(["rev-parse", "HEAD"]);
     const { code, stderr } = runHook(`refs/heads/main ${head} refs/heads/main ${base}\n`);
-    expect(code).toBe(1);
-    expect(stderr).toContain("engine.input_too_large");
+    // Secret-free, so it passes — but via slicing, NOT via an exemption. The
+    // absence of the skip notice is the assertion that matters: with no ignore
+    // rules configured, no path may be dropped from the scan.
+    expect(code).toBe(0);
     expect(stderr).not.toContain("skipped");
+    expect(stderr).not.toContain("engine.input_too_large");
   });
 
   test("(g) an ignore glob applies to a non-ASCII filename (core.quotePath=false)", () => {
