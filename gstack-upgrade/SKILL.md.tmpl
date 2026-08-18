@@ -120,67 +120,20 @@ OLD_VERSION=$(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo "unknown")
 
 ### Step 3.5: Sync personal fork from upstream (fork installs only)
 
-Some installs use a **fork-with-carried-patch** layout: `origin` is a personal
-fork that carries local commits on top of upstream, and a separate `upstream`
-remote points at the official repo. On those installs, Step 4's
-`git reset --hard origin/main` resets to the FORK's main — which keeps the local
-patch but would NOT pull new upstream on its own. This step syncs the fork
-(rebase local commits onto the latest upstream, push) FIRST, so the upgrade both
-keeps the patch AND advances to upstream. Vanilla installs (no `upstream` remote,
-or `upstream` URL == `origin` URL) skip this entirely — zero behavior change.
-
 ```bash
 cd "$INSTALL_DIR"
-ORIGIN_URL=$(git remote get-url origin 2>/dev/null || echo "")
-UPSTREAM_URL=$(git remote get-url upstream 2>/dev/null || echo "")
-FORK_SYNC_RESULT="skip"
-if [ -n "$UPSTREAM_URL" ] && [ "$UPSTREAM_URL" != "$ORIGIN_URL" ]; then
-  if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-    # Uncommitted tracked edits — don't rebase over them. Step 4 will stash +
-    # reset to the current (un-synced) fork main, keeping the patch, no new upstream.
-    FORK_SYNC_RESULT="dirty-skip"
-  elif ! git fetch upstream --quiet 2>/dev/null; then
-    FORK_SYNC_RESULT="fetch-failed"   # offline: fall through, upgrade to current fork state
-  else
-    UP_HEAD=$(git remote show upstream 2>/dev/null | sed -n 's/.*HEAD branch: //p' | head -1)
-    UP_HEAD=${UP_HEAD:-main}
-    git checkout main --quiet 2>/dev/null || true
-    if git rebase "upstream/$UP_HEAD" >/tmp/gstack-fork-rebase.log 2>&1; then
-      if git push --force-with-lease origin main >/tmp/gstack-fork-push.log 2>&1; then
-        FORK_SYNC_RESULT="ok"
-      else
-        FORK_SYNC_RESULT="push-failed"
-      fi
-    else
-      git rebase --abort 2>/dev/null || true
-      FORK_SYNC_RESULT="conflict"
-    fi
-  fi
-fi
-echo "FORK_SYNC_RESULT=$FORK_SYNC_RESULT"
+_O=$(git remote get-url origin 2>/dev/null || echo "")
+_U=$(git remote get-url upstream 2>/dev/null || echo "")
+if [ -n "$_U" ] && [ "$_U" != "$_O" ]; then echo "FORK_INSTALL=yes"; else echo "FORK_INSTALL=no"; fi
 ```
 
-Branch on `FORK_SYNC_RESULT`:
-- **`skip`** — vanilla install (no fork model). Proceed to Step 4 unchanged.
-- **`ok`** — fork rebased onto latest upstream and pushed. Proceed to Step 4; its
-  `reset --hard origin/main` now pulls upstream + your patch. Mention: "Synced your
-  fork onto the latest upstream, keeping your local patch."
-- **`dirty-skip`** — uncommitted edits in the install. Tell the user you skipped the
-  upstream sync (their edits are preserved) and are upgrading to the current fork
-  state (patch kept, no new upstream). Proceed to Step 4.
-- **`fetch-failed`** — couldn't reach upstream (likely offline). Tell the user, then
-  proceed to Step 4 (upgrades to current fork state: patch kept, no new upstream).
-- **`conflict`** — your local patch conflicts with new upstream (the rebase was
-  aborted, tree left clean). STOP. Do NOT run Step 4. Tell the user exactly:
-  "Your local patch conflicts with new upstream. Resolve it once: `cd $INSTALL_DIR
-  && git fetch upstream && git rebase upstream/main`, fix the conflicts, `git push
-  --force-with-lease origin main`, then re-run /gstack-upgrade. (See
-  /tmp/gstack-fork-rebase.log.)" End the upgrade here.
-- **`push-failed`** — rebase succeeded but the push to your fork was rejected. STOP.
-  Do NOT run Step 4 (its reset would discard the un-pushed rebase). Tell the user:
-  "Rebased locally but couldn't push to your fork. Run `cd $INSTALL_DIR && git push
-  --force-with-lease origin main`, then re-run /gstack-upgrade. (See
-  /tmp/gstack-fork-push.log.)" End the upgrade here.
+**`FORK_INSTALL=no`** (the common case) — nothing to do, go to Step 4.
+
+**`FORK_INSTALL=yes`** — you MUST read `$INSTALL_DIR/gstack-upgrade/FORK-SYNC.md`
+and follow it before Step 4. It rebases the carried patch onto the latest
+upstream, and defines two outcomes (`conflict`, `push-failed`) that STOP the
+upgrade: running Step 4's `reset --hard origin/main` after either would discard
+the user's work. Do not improvise this step from memory.
 
 ### Step 4: Upgrade
 
