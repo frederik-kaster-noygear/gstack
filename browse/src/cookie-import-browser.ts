@@ -662,7 +662,7 @@ async function dpapiDecrypt(encryptedBytes: Buffer): Promise<Buffer> {
     // runCaptured, not a pipe, per the fork's no-pipe-capture invariant.
     const { stdout, exitCode, timedOut, truncated } = await runCaptured(
       ['powershell', '-NoProfile', '-Command', script],
-      { stdin: encryptedBytes.toString('base64'), timeoutMs: 10_000, maxBytes: 64 * 1024 },
+      { stdin: encryptedBytes.toString('base64'), timeoutMs: 10_000, maxBytes: 64 * 1024, windowsHide: true },
     );
 
     if (timedOut) {
@@ -701,7 +701,7 @@ async function getMacKeychainPassword(service: string): Promise<string> {
   try {
     const { stdout, stderr, exitCode, timedOut, truncated } = await runCaptured(
       ['security', 'find-generic-password', '-s', service, '-w'],
-      { timeoutMs: 10_000, maxBytes: 64 * 1024 },
+      { timeoutMs: 10_000, maxBytes: 64 * 1024, windowsHide: true },
     );
     if (truncated) throw new Error('Credential process output exceeded the limit');
 
@@ -783,7 +783,7 @@ async function runPasswordLookup(cmd: string[], timeoutMs: number): Promise<stri
   // Captured async rather than via Bun.spawnSync, which would block the event
   // loop: secret-tool can hang on a keyring-unlock prompt.
   try {
-    const { stdout, exitCode, truncated } = await runCaptured(cmd, { timeoutMs, maxBytes: 64 * 1024 });
+    const { stdout, exitCode, truncated } = await runCaptured(cmd, { timeoutMs, maxBytes: 64 * 1024, windowsHide: true });
     if (truncated) return null;
     if (exitCode !== 0) return null;
 
