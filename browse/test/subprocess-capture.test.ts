@@ -187,9 +187,17 @@ describe('no subprocess output is captured through a pipe', () => {
   // Comments are stripped first so prose naming the banned pattern in order to
   // explain it doesn't trip a check meant for code.
   const SRC_GLOBS = ['browse/src/**/*.ts', 'design/src/**/*.ts'];
+  // Exempt, with reasons. cookie-import-browser.ts: upstream v1.88.1.0 gave the
+  // credential children their own bounded reader (concurrent drains, a
+  // whole-operation deadline, a 64 KiB cap) pinned by
+  // browse/test/cookie-credential-deadline.test.ts, and that path must also run
+  // under the Node polyfill (server-node.mjs), where runCaptured's BunFile
+  // destinations do not work. The fork's conversion was dropped on the
+  // 1.91.1.0 upgrade rather than carried against that suite.
+  const EXEMPT = new Set(['browse/src/cookie-import-browser.ts']);
 
   const sources = SRC_GLOBS.flatMap(g =>
-    Array.from(new Glob(g).scanSync(REPO_ROOT)).map(rel => ({
+    Array.from(new Glob(g).scanSync(REPO_ROOT)).filter(rel => !EXEMPT.has(rel)).map(rel => ({
       rel,
       src: fs.readFileSync(path.join(REPO_ROOT, rel), 'utf-8')
         .replace(/\/\*[\s\S]*?\*\//g, '')
