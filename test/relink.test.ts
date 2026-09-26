@@ -41,8 +41,10 @@ function run(cmd: string, env: Record<string, string> = {}, expectFail = false):
         ...process.env,
         ...env,
         GSTACK_STATE_DIR: dir,
-        GSTACK_HOME: dir,
-        GSTACK_STATE_ROOT: dir,
+        // An explicit GSTACK_HOME still wins: relink derives its backup root
+        // from it, and upstream's backup tests point it at tmpDir/home.
+        GSTACK_HOME: env.GSTACK_HOME ?? dir,
+        GSTACK_STATE_ROOT: env.GSTACK_STATE_ROOT ?? dir,
       },
       encoding: 'utf-8',
       timeout: 10000,
