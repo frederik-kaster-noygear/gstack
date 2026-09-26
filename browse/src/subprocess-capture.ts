@@ -33,8 +33,9 @@
  *
  * Handling secrets: `runCaptured` writes the child's output to a file inside a
  * `mkdtemp` directory, which POSIX creates 0700, and removes the whole
- * directory in a `finally`. For a credential-bearing capture (keychain
- * passwords, DPAPI-decrypted keys) that is a real if small widening of
+ * directory in a `finally`. (Cookie-import credential children no longer come
+ * through here: upstream's bounded reader in cookie-import-browser.ts owns them
+ * since the 1.91.1.0 upgrade.) For a credential-bearing capture that is a real if small widening of
  * exposure — owner-only for a few milliseconds, versus never touching disk.
  * It is the better trade here, because the alternative is not "no disk write",
  * it is a silently-empty credential that derives a wrong key and corrupts
@@ -55,8 +56,7 @@
  *   - The child can reach its own capture directory via /proc/self/fd/1 and read
  *     the sibling `stdin` file, which runs as the same uid and so is not stopped
  *     by file mode. Only pass a secret via `stdin` to a child that is the
- *     intended recipient of that secret — which is the case for the one caller
- *     that uses it (dpapiDecrypt hands PowerShell the blob PowerShell decrypts).
+ *     intended recipient of that secret.
  *
  * Reaping covers the direct child only. `proc.kill()` does not signal a process
  * group, so a child that backgrounds work leaves descendants running past the
@@ -86,9 +86,9 @@ export interface RunCapturedOptions {
    */
   maxBytes?: number;
   /**
-   * Hide the child's console window on Windows (#1835). Callers that shell out
-   * to a Windows-only probe (powershell, tasklist) must set this: without it
-   * every DPAPI decrypt or process check flashes a console window at the user.
+   * Hide the child's console window on Windows (#1835). runCaptured now always
+   * hides, because windows-spawn-hide.test.ts requires a literal
+   * `windowsHide: true` at every Bun.spawn site, so this is intent only.
    * Inert on POSIX.
    */
   windowsHide?: boolean;
@@ -204,7 +204,10 @@ export async function runCaptured(
       stdin: stdinSource as any,
       stdout: Bun.file(outPath) as any,
       stderr: Bun.file(errPath) as any,
-      windowsHide: opts.windowsHide ?? false,
+      // Always hidden: upstream's census (windows-spawn-hide.test.ts) requires a
+      // literal `windowsHide: true` at every Bun.spawn site, and no caller wants
+      // a console window. `opts.windowsHide` stays so call sites document intent.
+      windowsHide: true,
     } as any);
 
     let timedOut = false;
