@@ -185,7 +185,7 @@ describe('server.ts read-path wiring', () => {
   // forbids, to explain why. Asserting against commented-out prose would make
   // this test fail on its own documentation.
   const readPath = SERVER_SRC.slice(
-    SERVER_SRC.indexOf('resolvedSession = (tabId'),
+    SERVER_SRC.indexOf('let resolvedSession: TabSession | null = null;'),
     SERVER_SRC.indexOf('hasCookies: browserManager.hasCookieImports()'),
   ).replace(/^[ \t]*\/\/.*$/gm, '');
 
@@ -193,10 +193,16 @@ describe('server.ts read-path wiring', () => {
     expect(readPath.length).toBeGreaterThan(500);
   });
 
-  test('session is resolved from the pinned tab, not the global active tab', () => {
-    // getActiveSession() may appear only as the no-tabId fallback arm.
-    expect(readPath).toContain('browserManager.getSession(tabId)');
+  test('session is resolved once, inside the request-tab scope', () => {
+    // Upstream's runInRequestTab (session-tabs.ts, #1961) binds this request's
+    // tab before the impl runs, so getActiveSession() is the request's own tab
+    // there. The read path must capture it exactly once: a second call after an
+    // `await` could land on a tab a concurrent request moved to.
+    expect(SERVER_SRC).toContain(
+      'runInRequestTab(browserManager, body, tokenInfo, () => handleCommandInternalImpl(body, tokenInfo, opts))',
+    );
     expect(readPath.match(/browserManager\.getActiveSession\(\)/g) ?? []).toHaveLength(1);
+    expect(readPath).not.toContain('browserManager.getSession(');
   });
 
   test('no URL on the read path is resolved through the global active tab', () => {
